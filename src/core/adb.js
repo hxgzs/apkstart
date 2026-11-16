@@ -437,10 +437,16 @@ class AdbClient {
   }
 
   /** 从系统解析真正的启动 Activity（清单里解析不出来时的兜底） */
+  /**
+   * 查找 Android 为应用图标选择的启动组件。
+   * @param {string} pkg Android 包名。
+   * @returns {Promise<string|null>} 完整的组件名，未解析到时返回 null。
+   */
   async resolveLauncher(pkg) {
     try {
       const out = await this.shell(
-        `cmd package resolve-activity --brief ${pkg}`, { timeout: 10000 },
+        `cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER ${pkg}`,
+        { timeout: 10000 },
       );
       const m = /([\w.]+\/[.\w$]+)/.exec(String(out).split('\n').pop() || out);
       if (m && m[1].startsWith(`${pkg}/`)) return m[1];
@@ -448,7 +454,12 @@ class AdbClient {
     return null;
   }
 
-  /** 应用是否真的活着：am start 返回成功 ≠ 进程没崩 */
+  /**
+   * 等待应用进程出现，超时后读取启动崩溃日志。
+   * @param {string} pkg Android 包名。
+   * @param {number} timeoutMs 最长轮询时间，单位毫秒。
+   * @returns {Promise<object>} 进程出现或崩溃诊断结果。
+   */
   async waitAppAlive(pkg, timeoutMs = 12000) {
     const start = Date.now();
     while (Date.now() - start < timeoutMs) {
@@ -458,37 +469,104 @@ class AdbClient {
       // eslint-disable-next-line no-await-in-loop
       await sleep(1000);
     }
-    let crash = '';
-    try {
-      crash = await this.shell(
-        `logcat -d -t 250 -v brief AndroidRuntime:E DEBUG:E libc:E 2>/dev/null | `
-        + `grep -i -E '${pkg}|FATAL|ndk_translation|SIGABRT|SIGSEGV|UnsatisfiedLink' | tail -n 30`,
-        { timeout: 12000 },
-      );
-    } catch (_) { /* ignore */ }
-    const text = String(crash || '').trim();
-    // 没有崩溃日志时不能断言失败：部分大型应用首次启动要 20-40 秒
-    return { ok: false, crash: text, uncertain: !text };
+    return this.appLaunchCrash(pkg);
   }
+
+    /**
+     * 读取启动崩溃日志，供同步重试和兼容镜像判断使用。
+     * @param {string} pkg Android 包名。
+     * @returns {Promise<object>} 崩溃日志及其是否可确认。
+     */
+    async appLaunchCrash(pkg) {
+        const crash = await this.shell(
+            `logcat -d -t 250 -v brief AndroidRuntime:E DEBUG:E libc:E 2>/dev/null | `
+            + `grep -i -E '${pkg}|FATAL|ndk_translation|SIGABRT|SIGSEGV|UnsatisfiedLink' | tail -n 30`,
+            { timeout: 12000 },
+        ).catch(() => '');
+        const text = String(crash || '').trim();
+        return { ok: false, crash: text, uncertain: !text };
+    }
+
+    /**
+     * 等待目标包获得焦点，并让它自己的窗口完成绘制。系统启动占位图没有 Activity 组件名。
+     * @param {string} pkg Android 包名。
+     * @param {number} timeoutMs 最长等待时间，单位毫秒。
+     * @returns {Promise<boolean>} 当前前台窗口是否已绘制。
+     */
+    async waitAppDrawn(pkg, timeoutMs = 25000) {
+        const start = Date.now();
+        const query = 'dumpsys window -a | grep -E "mCurrentFocus=|Window #[0-9]+ Window|mDrawState=|^[[:space:]]+isVisible="';
+        while (Date.now() - start < timeoutMs) {
+            const out = await this.shell(query, { timeout: 3000 }).catch(() => '');
+            const focus = /mCurrentFocus=Window\{(\w+)\s+u\d+\s+([^/\s}]+)\//.exec(out);
+            if (focus?.[2] === pkg) {
+                const window = out.split(/^\s*Window #\d+ Window\{/m)
+                    .find((block) => block.startsWith(`${focus[1]} `));
+                if (window && /\bmDrawState=HAS_DRAWN\b/.test(window) && /\bisVisible=true\b/.test(window)) return true;
+            }
+            await sleep(250);
+        }
+        return false;
+    }
+
+    /**
+     * 窗口显示后检查应用进程是否在启动后的短时间内退出。
+     * @param {string} pkg Android 包名。
+     * @param {AbortSignal} signal 应用切换、窗口关闭或程序退出时取消检查。
+     * @returns {Promise<boolean>} 是否未观察到进程退出。
+     */
+    async monitorAppStartup(pkg, signal) {
+        const deadline = Date.now() + 5000;
+        while (!signal.aborted && Date.now() < deadline) {
+            const state = await this.shell(`pidof ${pkg} || echo stopped`, { timeout: 1500 }).catch(() => '');
+            if (signal.aborted) return true;
+            if (state === 'stopped') return false;
+            await sleep(750);
+        }
+        return true;
+    }
 
   /**
    * 启动应用，带三级降级：
    *   freeform 独立窗口 → 普通全屏 → monkey 兜底；
-   * 每次都验证进程是否存活，崩溃时抓 logcat 并抛带 code 的错误供上层自动切镜像。
+   * 窗口启动等待前台绘制，其他调用等待进程出现。失败时保留兼容镜像的崩溃诊断。
+   * @param {string} pkg Android 包名。
+   * @param {string|null} activity APK 记录的备用启动组件或 Activity 类名。
+   * @param {object} options 启动选项。
+   * @param {boolean} [options.freeform] 是否先尝试 Android 自由窗口模式。
+   * @param {object|null} [options.bounds] 可选的任务窗口范围。
+   * @param {boolean} [options.forceStop] 启动前是否停止已有应用进程。
+   * @param {boolean} [options.waitForDraw] 是否等待目标应用的前台窗口完成绘制。
+   * @returns {Promise<string>} 启动命令的结果。
    */
-  async startApp(pkg, activity, { freeform = true, bounds = null, forceStop = false } = {}) {
+  async startApp(pkg, activity, { freeform = true, bounds = null, forceStop = false, waitForDraw = false } = {}) {
     if (forceStop) await this.forceStop(pkg);
     // 必须用系统解析出来的 LAUNCHER 入口，不能只用 APK 里解析到的主 Activity：
     // 很多应用（红果短剧等）的启动页才做真正的初始化，直接进主 Activity 会
     // 抛 "had you called RpcService.init"，表现为点开闪一下就没了。
     const resolved = (await this.resolveLauncher(pkg).catch(() => '')) || activity;
-    const intent = resolved
-      ? ['-n', `${pkg}/${resolved}`]
-      : ['-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER', '-p', pkg];
+    const component = resolved && (resolved.includes('/') ? resolved : `${pkg}/${resolved}`);
+    const intent = ['-a', 'android.intent.action.MAIN', '-c', 'android.intent.category.LAUNCHER',
+        ...(component ? ['-n', component] : ['-p', pkg])];
     const modes = freeform
       ? [['--windowingMode', '5'], []]
       : [[]];
     let lastError = '';
+
+    /**
+     * 校验一次启动命令产生的画面或进程，并保留崩溃诊断。
+     * @param {number} timeoutMs 进程轮询超时时间，单位毫秒。
+     * @returns {Promise<object>} 启动验证或诊断结果。
+     */
+    const verify = async (timeoutMs) => {
+        if (!waitForDraw) return this.waitAppAlive(pkg, timeoutMs);
+        if (await this.waitAppDrawn(pkg)) return { ok: true };
+        const result = await this.appLaunchCrash(pkg);
+        if (!result.uncertain) return result;
+        const error = new Error(`${pkg} 在等待时间内未绘制前台窗口`);
+        error.code = 'APP_NO_FRAME';
+        throw error;
+    };
 
     for (const mode of modes) {
       const parts = ['am', 'start', ...mode, '--activity-clear-top', ...intent];
@@ -504,7 +582,7 @@ class AdbClient {
 
       if (bounds) this.resizeTaskOfPackage(pkg, bounds).catch(() => {});
       // eslint-disable-next-line no-await-in-loop
-      const alive = await this.waitAppAlive(pkg, 6000);
+      const alive = await verify(6000);
       if (alive.ok) return out;
       if (alive.uncertain) return `${out}\n（应用仍在加载中）`;
       lastError = alive.crash || lastError;
@@ -522,15 +600,16 @@ class AdbClient {
       const out = await this.shell(
         `monkey -p ${pkg} -c android.intent.category.LAUNCHER 1`, { timeout: 20000 },
       );
-      const alive = await this.waitAppAlive(pkg, 12000);
+      const alive = await verify(12000);
       if (alive.ok || alive.uncertain) return out;
       lastError = alive.crash || lastError;
     } catch (e) {
+      if (e.code === 'APP_NO_FRAME') throw e;
       // 有明确崩溃信息时优先用它，否则保留原始启动错误
       if (!lastError) lastError = String(e.message || e);
     }
 
-    if (!lastError) return 'started';
+    if (!lastError && !waitForDraw) return 'started';
     const err = new Error(friendlyLaunchError(lastError, pkg));
     err.code = 'APP_CRASHED';
     err.crash = lastError;
@@ -589,6 +668,27 @@ class AdbClient {
     const out = await this.shell('wm size');
     const m = /(\d+)x(\d+)/.exec(out.split('\n').pop() || out);
     return m ? { width: Number(m[1]), height: Number(m[2]) } : null;
+  }
+
+  /**
+   * 通过模拟器控制台原地转动显示面板，Android 与 Windows 共用同一个方向。
+   * @param {boolean} landscape 是否切到正向横屏，否则切到正向竖屏。
+   * @throws {Error} 控制台无法读取或切换显示方向。
+   */
+  async rotateEmulatorDisplay(landscape) {
+    for (let turns = 0; turns < 4; turns += 1) {
+        const { stdout } = await this.exec(['emu', 'sensor', 'get', 'acceleration'], { timeout: 3000 });
+        const sample = /acceleration\s*=\s*([^:\r\n]+):([^:\r\n]+):([^\r\n]+)/i.exec(stdout);
+        if (!sample) throw new Error('无法读取模拟器的当前显示方向');
+        const x = Number(sample[1]);
+        const y = Number(sample[2]);
+        if (!Number.isFinite(x) || !Number.isFinite(y)) throw new Error('模拟器返回了无效的显示方向');
+        if (landscape ? x < -5 && Math.abs(y) < 5 : y > 5 && Math.abs(x) < 5) return;
+        if (turns === 3) break;
+        const rotation = await this.exec(['emu', 'rotate'], { timeout: 3000 });
+        if (!/^OK\s*$/m.test(rotation.stdout)) throw new Error('模拟器拒绝切换显示方向');
+    }
+    throw new Error('模拟器未能转到应用需要的显示方向');
   }
 
   async androidVersion() {

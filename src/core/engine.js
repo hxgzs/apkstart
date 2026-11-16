@@ -49,8 +49,15 @@ const ATTACH_ENDPOINTS = [
 ];
 
 class Runtime {
-  constructor(appRoot) {
+  /**
+   * 创建运行时控制器。
+   * @param {string} appRoot 应用资源根目录。
+   * @param {object} options 可选的桌面集成。
+   * @param {Function} [options.probeWindow] 检查指定端口或进程是否拥有可嵌入的窗口。
+   */
+  constructor(appRoot, { probeWindow = null } = {}) {
     this.appRoot = appRoot;
+    this.probeWindow = probeWindow;
     this.provisioner = new Provisioner(appRoot);
     this.emulator = new EmulatorEngine(appRoot);
     this.vmProc = null;
@@ -65,6 +72,35 @@ class Runtime {
     this.emuSerial = EMU_SERIAL;   // 端口是动态挑的，serial 跟着变
     store.ensureDirs();
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+  }
+
+  /**
+   * 将 ADB 设备映射到 Windows 上对应的模拟器窗口目标。
+   * @param {string} serial ADB 设备序列号。
+   * @returns {{port?: number, pid?: number}|null} 可用于查找窗口的标识。
+   */
+  windowTarget(serial) {
+    if (this.vmProc?.pid && !this.vmProc.killed && serial === '127.0.0.1:5555') {
+        return { pid: this.vmProc.pid };
+    }
+    const emulator = /^emulator-(\d+)$/.exec(serial);
+    if (emulator) return { port: Number(emulator[1]) };
+    const tcp = /^(?:127\.0\.0\.1|localhost):(\d+)$/.exec(serial);
+    const port = tcp ? Number(tcp[1]) - 1 : 0;
+    return port >= EMU_PORT && port % 2 === 0 ? { port } : null;
+  }
+
+  /**
+   * 检查已在线的设备是否有可以显示的窗口。
+   * @param {string} serial ADB 设备序列号。
+   * @returns {Promise<boolean>} 桌面模式下是否找到该设备的窗口。
+   */
+  async canReuse(serial) {
+    if (!this.probeWindow) return true;
+    const target = this.windowTarget(serial);
+    if (!target) return false;
+    const window = await this.probeWindow(target);
+    return Boolean(window.emu);
   }
 
   get settings() { return store.getSettings(); }
@@ -146,7 +182,7 @@ class Runtime {
     }
 
     try {
-      result.deviceOnline = await client.isOnline();
+      result.deviceOnline = await client.isOnline() && await this.canReuse(client.serial);
       if (result.deviceOnline) {
         const [android, sdk, ff] = await Promise.all([
           client.androidVersion().catch(() => ''),
@@ -231,13 +267,21 @@ class Runtime {
     return args;
   }
 
-  async boot({ install = false, onLog = () => {} } = {}) {
+  /**
+   * 启动内置运行时。
+   * @param {object} options 启动选项。
+   * @param {boolean} [options.install] 是否启动 QEMU 安装环境。
+   * @param {boolean} [options.landscape] 是否启动横屏模拟器。
+   * @param {Function} [options.onLog] 进度回调。
+   * @returns {Promise<object>} 启动结果。
+   */
+  async boot({ install = false, landscape = false, onLog = () => {} } = {}) {
     const env = await this.provisioner.checkEnv();
     this._hv = env.hypervisor;
 
     // 首选：官方 emulator（自带设备模型与 GPU 转译，体验最好）
     if (env.emulator.ok && env.sysimg.ok) {
-      return this.bootEmulator({ env, onLog });
+      return this.bootEmulator({ env, onLog, landscape });
     }
 
     return this.bootQemu({ install, env, onLog });
@@ -246,8 +290,13 @@ class Runtime {
   /**
    * 用官方 emulator 启动 Android。
    * 与 QEMU+ISO 不同，这里没有"安装系统"这一步：镜像本身就是系统，首次启动即开机。
+   * @param {object} options 模拟器启动选项。
+   * @param {object} options.env 运行时能力与加速检测结果。
+   * @param {Function} [options.onLog] 进度回调。
+   * @param {boolean} [options.landscape] 是否使用横屏尺寸。
+   * @returns {Promise<object>} 可用设备或启动错误。
    */
-  async bootEmulator({ env, onLog = () => {} } = {}) {
+  async bootEmulator({ env, onLog = () => {}, landscape = false } = {}) {
     if (this.vmStarting) {
       const started = Date.now();
       while (this.vmStarting && Date.now() - started < 300000) {
@@ -255,7 +304,7 @@ class Runtime {
         await new Promise((r) => setTimeout(r, 500));
       }
       const c = this.client();
-      if (await c.isOnline()) {
+      if (await c.isOnline() && await this.canReuse(c.serial)) {
         await this.prepare(c);
         return { ok: true, client: c, reused: true };
       }
@@ -285,6 +334,7 @@ class Runtime {
 
       const st = await this.emulator.start({
         headless: this.settings.engine.headless !== false,
+        landscape,
         onLog,
         probe,
       });
@@ -292,8 +342,8 @@ class Runtime {
       this.emuSerial = st.serial || this.emulator.serial;
       const client = this.client(this.emuSerial);
       await this.prepare(client);
-      // 开机成功后存一份快照，下次打开走 quickboot
-      this.emulator.saveSnapshotSoon(this.adbPath());
+      // CLI 启动仍可预存快照。桌面启动期间的快照会弹出模拟器自带进度窗。
+      if (!this.probeWindow && !landscape) this.emulator.saveSnapshotSoon(this.adbPath());
       return { ok: true, client, engine: 'emulator', serial: this.emuSerial, profile: st.profile };
     } catch (e) {
       // 把自动重试/诊断结论原样抛给 UI，避免再包一层含糊的「启动失败」
@@ -450,6 +500,7 @@ class Runtime {
   async stop({ graceful = true } = {}) {
     if (this.emulator.running()) {
       await this.emulator.stop({ adbPath: this.adbPath() });
+      this._activeApps.clear();
       return true;
     }
     // 接管来的模拟器（adoptExisting）在本进程里没有 proc 句柄，旧逻辑会直接
@@ -614,20 +665,25 @@ class Runtime {
     return found;
   }
 
+  /**
+   * 接管已有窗口且 Android 已启动的模拟器。
+   * @param {object} options 接管选项。
+   * @param {Function} [options.onLog] 运行时日志回调。
+   * @returns {Promise<object|null>} 接管结果，或没有可接管的模拟器。
+   */
   async adoptExisting({ onLog = () => {} } = {}) {
     const alive = await this.emulatorPorts();
     if (!alive.length) {
       onLog('没有发现上一台运行时，准备冷启动');
       return null;
     }
-    onLog(`发现 ${alive.length} 台残留运行时（端口 ${alive.join(', ')}），尝试接管`);
-
-    // adb server 里可能还留着上个进程的 offline 记录（模拟器重启过 adbd 就会这样），
-    // 先清掉再连，否则 get-state 永远返回 offline，会误判成"没就绪"把好好的机器杀掉。
-    await this.client().exec(['kill-server'], { withSerial: false, timeout: 8000 }).catch(() => {});
-
     for (const port of alive) {
       const serial = `127.0.0.1:${port + 1}`;
+      if (!(await this.canReuse(serial))) {
+          onLog(`跳过运行时 ${serial}：没有符合启动要求的模拟器窗口`);
+          continue;
+      }
+      onLog(`发现带窗口的运行时（${serial}），尝试接管`);
       const c = this.client(serial);
       let booted = '';
       for (let i = 0; i < 6 && booted !== '1'; i += 1) {
@@ -642,17 +698,7 @@ class Runtime {
         if (booted !== '1') await new Promise((r) => setTimeout(r, 700));
       }
       if (booted !== '1') {
-        onLog(`发现上一台运行时（${serial}）但没就绪，先关掉它再重新开机`);
-        // AVD 目录有锁：留着这台会让新实例直接退出，表现成"怎么都开不了机"。
-        // adb 都连不上了，只能按控制台端口找到进程强杀。
-        const pid = await this.pidOnPort(port);
-        if (pid) {
-          await new Promise((resolve) => {
-            const { execFile } = require('child_process');
-            execFile('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true }, () => resolve());
-          });
-        }
-        await new Promise((r) => setTimeout(r, 1200));
+        onLog(`跳过运行时 ${serial}：Android 尚未就绪`);
         continue;
       }
       this.emuSerial = serial;
@@ -689,9 +735,16 @@ class Runtime {
     return this.emulator.killOrphanProcesses({ onLog });
   }
 
-  async ensure({ onLog = () => {} } = {}) {
+  /**
+   * 复用可用运行时，或启动自带运行时。
+   * @param {object} options 启动选项。
+   * @param {Function} [options.onLog] 运行时日志回调。
+   * @param {boolean} [options.landscape] 应用需要原生横屏布局。
+   * @returns {Promise<object>} 运行时连接或失败说明。
+   */
+  async ensure({ onLog = () => {}, landscape = false } = {}) {
     const client = this.client();
-    if (await client.isOnline()) {
+    if (await client.isOnline() && await this.canReuse(client.serial)) {
       await this.prepare(client);
       return { ok: true, client, engine: 'builtin', reused: true };
     }
@@ -705,8 +758,8 @@ class Runtime {
     // 上次会话遗留 / 别的进程拉起的 emulator：换个端口也要复用，绝不重复开一台
     try {
       const devices = await client.devices();
-      const running = devices.find((d) => /^emulator-\d+$/.test(d.serial) && d.state === 'device');
-      if (running) {
+      for (const running of devices) {
+        if (!/^emulator-\d+$/.test(running.serial) || running.state !== 'device' || !(await this.canReuse(running.serial))) continue;
         this.emuSerial = running.serial;
         const m = /(\d+)$/.exec(running.serial);
         if (m) this.emulator.port = Number(m[1]);
@@ -717,9 +770,9 @@ class Runtime {
     } catch (_) { /* 没找到就正常拉起 */ }
 
     // 进程还在但设备离线（多半卡在引导）：先停掉再重新拉起，避免干等
-    if (this.emulator.running()) {
+    if (this.emulator.running() && !this.vmStarting) {
       onLog('检测到卡住的运行时，正在重启…');
-      await this.emulator.stop({ adbPath: this.adbPath() });
+      await this.emulator.stop({ adbPath: this.adbPath(), saveSnapshot: false });
     }
 
     const s = this.settings;
@@ -728,15 +781,15 @@ class Runtime {
     if (s.engine.mode === 'attach') {
       onLog('正在探测已有运行时…');
       const found = await this.probe();
-      if (found.length) {
-        store.saveSettings({ device: found[0].serial });
-        const c2 = this.client(found[0].serial);
-        if (await c2.isOnline()) {
+      for (const candidate of found) {
+        const c2 = this.client(candidate.serial);
+        if (await c2.isOnline() && await this.canReuse(c2.serial)) {
+          store.saveSettings({ device: candidate.serial });
           await this.prepare(c2);
-          return { ok: true, client: c2, engine: found[0].name };
+          return { ok: true, client: c2, engine: candidate.name };
         }
       }
-      return { ok: false, needsSetup: 'attach', error: '未发现可用的已有运行时' };
+      return { ok: false, needsSetup: 'attach', error: '未发现在线且有可嵌入窗口的运行时，请以带窗口模式启动模拟器，或切回内置运行时' };
     }
 
     // 默认：自带运行时
@@ -749,9 +802,9 @@ class Runtime {
       // 关掉 ApkStart 后可能残留未接管的模拟器（detached 的 qemu 仍存活），
       // 它一直占着 AVD 锁，会让冷启直接 FATAL "Running multiple emulators with the same AVD"。
       // 接管失败时先把这些孤儿清掉，再冷启，保证「关掉再开」一定能起来。
-      await this.killOrphanEmulators({ onLog }).catch(() => {});
+      if (!this.vmStarting) await this.killOrphanEmulators({ onLog }).catch(() => {});
       try {
-        const r = await this.boot({ onLog });
+        const r = await this.boot({ onLog, landscape });
         if (r.ok) return { ok: true, client: r.client, engine: 'emulator', profile: r.profile };
         return {
           ok: false, error: r.error, env,
@@ -915,20 +968,35 @@ class Runtime {
     });
   }
 
-  dispose() {
-    if (this._watchdog) clearInterval(this._watchdog);
-    if (this._client && this._client.disposeInput) this._client.disposeInput();
-    if (this.emulator.running()) {
-      try { this.emulator.proc.kill(); } catch (_) { /* ignore */ }
-    }
-    if (this.vmProc) {
-      try { this.vmProc.kill(); } catch (_) { /* ignore */ }
-      this.vmProc = null;
-    }
-    // 退出时务必清掉 detached 的 qemu 进程：它独立于 ApkStart 存活（为了下次秒开），
-    // 不在此强杀会一直锁住安装目录里的文件，导致卸载不干净、第三方粉碎工具也删不掉。
-    // 仅在本进程真正退出时调用，不影响「关窗口→托盘常驻→下次秒开」的体验。
-    this.emulator.killOrphanProcesses().catch(() => {});
+  /**
+   * 关闭本实例启动的运行时。退出前等待内置模拟器保存快照并停止。
+   * @param {object} [options] 退出选项。
+   * @param {Function} [options.onLog] 接收保存和关机进度的回调。
+   * @returns {Promise<void>} 本实例的运行时已停止。
+   */
+  async dispose({ onLog } = {}) {
+      if (this._watchdog) clearInterval(this._watchdog);
+      if (this._client && this._client.disposeInput) this._client.disposeInput();
+      if (this.emulator.running()) {
+          if (this.emulator.snapshotReady && (this._activeApps.size || this.emulator.hardwareDecode)) {
+              const client = this.client(this.emulator.serial);
+              await Promise.all([...this._activeApps].map((pkg) => client.forceStop(pkg).catch(() => {})));
+              // 保存空闲桌面，避免将应用播放中的解码器与活动渲染画面带入快照。
+              const home = await client.shell('am start -W -a android.intent.action.MAIN -c android.intent.category.HOME',
+                  { timeout: 5000 }).catch(() => '');
+              if (this.emulator.hardwareDecode) {
+                  // Goldfish 需要等待客户端退出后的 Binder 清理，再序列化设备状态。
+                  await new Promise((resolve) => setTimeout(resolve, 2000));
+                  if (!/Status: ok/.test(home)) {
+                      onLog?.('未能确认安卓已回到桌面，跳过本次硬解快照保存');
+                      await this.emulator.stop({ adbPath: this.adbPath(), saveSnapshot: false, onLog });
+                      return;
+                  }
+              }
+          }
+          await this.emulator.stop({ adbPath: this.adbPath(), onLog });
+      }
+      if (this.vmProc) await this.stop();
   }
 
   get bootLog() { return this._bootLog.slice(-60); }

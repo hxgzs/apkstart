@@ -34,6 +34,8 @@ class AppWindow {
     this.mouseHook = mouseHook;
     this.pointerConfig = pointerConfig;
     this.win = null;
+    this.embedded = false;
+    this.closing = null;
     this.pkg = null;
     this.state = { label: '', tip: '', ready: false, landscape: false };
     this._fitTimer = null;
@@ -72,28 +74,38 @@ class AppWindow {
 
   /**
    * 打开（或复用）应用窗口。
-   * @param {object} o { pkg, label, iconPath, portrait, fullscreen, onClosed }
+   * @param {object} o 应用包名、名称、图标、尺寸预设、显示方向及关闭回调。
+   * @param {boolean} [o.landscape] 是否以横屏尺寸打开窗口。
+   * @returns {BrowserWindow} 宿主窗口。
    */
   open(o) {
-    const { pkg, label, iconPath, portrait, fullscreen } = o;
+    const { pkg, label, iconPath, portrait, fullscreen, landscape = false } = o;
     this._closedCb = o.onClosed || null;
-    if (this.isOpen && this.pkg === pkg) {
-      this.win.show();
-      this.win.focus();
-      return this.win;
-    }
-    this.close({ keepApp: true });
-
     this.pkg = pkg;
     this.portrait = portrait || { w: 540, h: 960 };
-    this.state = { label: label || '应用', tip: '正在启动安卓运行时…', ready: false, landscape: false };
+    this.state = { label: label || '应用', tip: '正在启动安卓运行时…', ready: false, landscape };
 
     const area = this._area();
-    const size = AppWindow.sizeFor(area, this.portrait, false);
+    const size = AppWindow.sizeFor(area, this.portrait, landscape);
     const w = Math.max(320, size.w);
     const h = Math.max(420, size.h + TITLEBAR_H);
 
     const iconFile = iconPath && fs.existsSync(iconPath) ? nativeImage.createFromPath(iconPath) : undefined;
+    if (this.isOpen) {
+        this.win.setTitle(this.state.label);
+        if (iconFile) this.win.setIcon(iconFile);
+        if (!this.win.isMaximized()) {
+            this.win.setBounds({
+                x: Math.round(area.x + (area.w - w) / 2),
+                y: Math.round(area.y + (area.h - h) / 2),
+                width: w,
+                height: h,
+            });
+        }
+        this.win.hide();
+        this._push();
+        return this.win;
+    }
 
     this.win = new BrowserWindow({
       width: w,
@@ -125,10 +137,9 @@ class AppWindow {
     // 这里挡住，让 OS 标题一直等于应用名（任务栏悬浮提示、Alt+Tab 都靠它）。
     this.win.webContents.on('page-title-updated', (e) => {
       e.preventDefault();
-      try { this.win.setTitle(label || 'ApkStart'); } catch (_) { /* 窗口可能已销毁 */ }
+      try { this.win.setTitle(this.state.label); } catch (_) { /* 窗口可能已销毁 */ }
     });
     this.win.once('ready-to-show', () => {
-      this.win.show();
       this._push();
     });
 
@@ -142,12 +153,15 @@ class AppWindow {
       this.scheduleFit();
     });
     this.win.on('minimize', () => { this.agent.hide().catch(() => {}); });
-    this.win.on('close', () => { this._closing = true; });
+    this.win.on('close', (event) => {
+        event.preventDefault();
+        this.close().catch(() => {});
+    });
     this.win.on('closed', () => {
       this.win = null;
+      this.embedded = false;
       const pkg = this.pkg;
       this.pkg = null;
-      this._closing = false;
       if (this._closedCb) this._closedCb(pkg);
     });
     // 只在「应用窗口真正处于前台」且至少一项鼠标映射开启时装全局钩子；
@@ -203,29 +217,46 @@ class AppWindow {
 
   setIcon(p) { this.iconUrl = iconUrl(p); this._push(); }
 
-  /** 把模拟器窗口嵌进当前窗口，并铺满标题栏以下的区域 */
-  async embed() {
-    if (!this.isOpen) return false;
+  /**
+   * 嵌入指定运行时的显示窗口，失败时交给启动流程显示具体原因。
+   * @param {{port?: number, pid?: number}|null} target 运行时的窗口标识。
+   * @throws {Error} 宿主窗口已关闭、找不到显示窗口或窗口代理嵌入失败。
+   */
+  async embed(target) {
+    if (!this.isOpen) throw new Error('应用窗口已关闭，请重新打开应用');
     const hwnd = this._hwnd();
-    if (!hwnd) return false;
-    const r = await this.agent.embed(hwnd, this._rect()).catch(() => null);
-    return !!(r && r.ok);
+    if (!hwnd) throw new Error('无法取得 ApkStart 应用窗口的句柄');
+    if (!target) throw new Error('当前安卓运行时没有可嵌入的窗口');
+    const result = await this.agent.embed(hwnd, this._rect(), target);
+    if (result.ok) {
+        this.embedded = true;
+        return;
+    }
+    if (result.error === 'no-window') throw new Error('未找到可嵌入的安卓模拟器窗口');
+    if (result.error === 'set-parent-failed') {
+        throw new Error(`Windows 未能将模拟器窗口嵌入 ApkStart（错误代码 ${result.win32}）`);
+    }
+    throw new Error('窗口代理未能嵌入安卓模拟器窗口');
   }
 
+  /** 在应用画面就绪后，将模拟器窗口贴合宿主客户区。 */
   async fitNow() {
-    if (!this.isOpen) return;
+    if (!this.isOpen || !this.state.ready) return;
     await this.agent.fit(this._rect()).catch(() => {});
   }
 
-  /** 模拟器子窗口应该占据的矩形（物理像素，已把 8px 内边距推出可视区） */
+  /**
+   * 计算模拟器子窗口的物理像素矩形，给标题栏和控制按钮留出完整空间。
+   * @returns {{x: number, y: number, w: number, h: number}} 宿主客户区内的画面矩形。
+   */
   _rect() {
     const sf = this._scale();
     const b = this.win.getContentBounds();
     return {
       x: -EMU_PAD,
-      y: Math.round(TITLEBAR_H * sf) - EMU_PAD,
+      y: Math.round(TITLEBAR_H * sf),
       w: Math.round(b.width * sf) + EMU_PAD * 2,
-      h: Math.round((b.height - TITLEBAR_H) * sf) + EMU_PAD * 2,
+      h: Math.round((b.height - TITLEBAR_H) * sf) + EMU_PAD,
     };
   }
 
@@ -250,17 +281,13 @@ class AppWindow {
 
   /**
    * 横竖屏切换。
-   * 两步：先让 Android 按目标方向重新排版（画面始终是正的），再让模拟器按新比例
-   * 重排一次窗口（它自己会算，CtrL+← 只是触发重排，不会改 Android 的方向），
-   * 最后把我们的窗口换成同样的比例。
+   * 先转动模拟器画面，再按目标方向调整宿主窗口尺寸。
+   * @returns {Promise<boolean>} 切换后的窗口是否为横屏。
    */
   async rotate() {
     if (!this.isOpen) return this.state.landscape;
     const next = !this.state.landscape;
-    if (this.setOrientation) await this.setOrientation(next).catch(() => {});
-    await sleep(700);
-    await this.agent.rotate(next ? 'left' : 'right').catch(() => {});
-    await sleep(800);
+    if (this.setOrientation && !(await this.setOrientation(next))) return this.state.landscape;
     const area = this._area();
     const size = AppWindow.sizeFor(area, this.portrait, next);
     if (!this.win.isMaximized()) {
@@ -291,16 +318,32 @@ class AppWindow {
   minimize() { if (this.isOpen) this.win.minimize(); }
 
   /**
-   * 关闭窗口。默认同时停掉这个安卓应用（省内存），但保留引擎，下次点开是秒开。
+   * 隐藏并移出模拟器画面后关闭宿主窗口，保留运行时供下次启动复用。
+   * @param {object} options 关闭选项。
+   * @param {boolean} [options.keepApp] 是否保留 Android 应用进程。
+   * @returns {Promise<void>} 窗口及应用清理完成后返回。
    */
-  close({ keepApp = false } = {}) {
+  async close({ keepApp = false } = {}) {
+    if (this.closing) return this.closing;
     if (!this.isOpen) return;
+    const win = this.win;
     const pkg = this.pkg;
+    this.state.ready = false;
     this._syncHook(false);
-    this.agent.hide().catch(() => {});
-    try { this.win.destroy(); } catch (_) { /* ignore */ }
-    this.win = null;
-    if (!keepApp && pkg && this._onCloseApp) this._onCloseApp(pkg);
+    this.closing = (async () => {
+        let detached = !this.embedded;
+        if (this.embedded) {
+            const result = await this.agent.detach().catch(() => null);
+            detached = Boolean(result?.ok);
+        }
+        // 保留无法脱离的隐藏宿主，避免 Windows 连带销毁模拟器画面。
+        if (!win.isDestroyed()) {
+            if (detached) win.destroy();
+            else win.hide();
+        }
+        if (!keepApp && pkg && this._onCloseApp) await this._onCloseApp(pkg);
+    })();
+    try { await this.closing; } finally { this.closing = null; }
   }
 
   onCloseApp(cb) { this._onCloseApp = cb; }

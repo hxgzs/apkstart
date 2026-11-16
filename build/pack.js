@@ -13,6 +13,11 @@ let OUT = process.env.APKSTART_PACK_OUT
   ? path.resolve(process.env.APKSTART_PACK_OUT)
   : path.join(ROOT, 'dist', 'ApkStart-win64-portable');
 const ELECTRON_DIST = path.join(ROOT, 'node_modules', 'electron', 'dist');
+const PORTABLE_EMULATOR = process.env.APKSTART_PACK_EMULATOR;
+if (PORTABLE_EMULATOR && (!fs.existsSync(path.join(PORTABLE_EMULATOR, 'emulator.exe'))
+    || !fs.existsSync(path.join(PORTABLE_EMULATOR, 'qemu', 'windows-x86_64', 'qemu-system-x86_64.exe')))) {
+    throw new Error('APKSTART_PACK_EMULATOR 必须指向完整的 Windows x64 Android Emulator 目录');
+}
 
 function copy(src, dest) {
   fs.cpSync(src, dest, { recursive: true });
@@ -64,6 +69,10 @@ for (const opt of ['tools', 'engine']) {
 }
 
 // 4. 改名主程序
+if (PORTABLE_EMULATOR) {
+    console.log('复制经过验证的 Android Emulator…');
+    copy(PORTABLE_EMULATOR, path.join(OUT, 'resources', 'runtime', 'emulator'));
+}
 fs.renameSync(path.join(OUT, 'electron.exe'), path.join(OUT, 'ApkStart.exe'));
 
 // 5. 版本信息

@@ -36,9 +36,11 @@ public class ApkAgent
 
     [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr p);
     [DllImport("user32.dll")] static extern bool IsWindowVisible(IntPtr h);
+    [DllImport("user32.dll")] static extern bool IsWindow(IntPtr h);
+    [DllImport("user32.dll")] static extern IntPtr SetThreadDpiAwarenessContext(IntPtr context);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassNameW(IntPtr h, StringBuilder s, int n);
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowTextW(IntPtr h, StringBuilder s, int n);
-    [DllImport("user32.dll")] static extern IntPtr SetParent(IntPtr c, IntPtr p);
+    [DllImport("user32.dll", SetLastError = true)] static extern IntPtr SetParent(IntPtr c, IntPtr p);
     [DllImport("user32.dll")] static extern IntPtr GetParent(IntPtr c);
     [DllImport("user32.dll")] static extern int GetWindowLong(IntPtr h, int i);
     [DllImport("user32.dll")] static extern int SetWindowLong(IntPtr h, int i, int v);
@@ -91,6 +93,10 @@ public class ApkAgent
 
     static IntPtr _host = IntPtr.Zero;
     static IntPtr _emu = IntPtr.Zero;
+    static long _emuPort;
+    static long _emuPid;
+    static long _parkPort;
+    static long _lastPark;
     static IntPtr _hook = IntPtr.Zero;
     static HookProc _hookProc = null;
     static Thread _hookThread = null;
@@ -132,15 +138,32 @@ public class ApkAgent
     // The emulator draws its framebuffer in a "QWindowIcon" top level window titled
     // "Android Emulator - <avd>:<port>"; the volume/rotate rail lives in a separate
     // small "QWindowTool*" window we hide.
-    static IntPtr FindEmulator()
+    /// <summary>Find the framebuffer for the requested console port or QEMU process.</summary>
+    /// <param name="port">Android Emulator console port, or zero for QEMU.</param>
+    /// <param name="pid">QEMU process ID, or zero for Android Emulator.</param>
+    /// <returns>The matching window handle, including a previously embedded window.</returns>
+    static IntPtr FindEmulator(long port, long pid)
     {
+        if (port <= 0 && pid <= 0) return IntPtr.Zero;
+        if (port == _emuPort && pid == _emuPid && IsWindow(_emu)) return _emu;
         IntPtr best = IntPtr.Zero;
         long bestArea = 0;
         EnumWindows(delegate(IntPtr h, IntPtr p)
         {
-            if (!IsWindowVisible(h)) return true;
-            string cls = ClassOf(h);
-            if (cls.IndexOf("QWindowIcon", StringComparison.Ordinal) < 0) return true;
+            if (port > 0)
+            {
+                string title = TitleOf(h);
+                if (ClassOf(h).IndexOf("QWindowIcon", StringComparison.Ordinal) < 0 ||
+                    !title.StartsWith("Android Emulator - ", StringComparison.OrdinalIgnoreCase) ||
+                    !title.EndsWith(":" + port, StringComparison.Ordinal)) return true;
+            }
+            else
+            {
+                if (!IsWindowVisible(h)) return true;
+                uint owner;
+                GetWindowThreadProcessId(h, out owner);
+                if (owner != pid || !TitleOf(h).StartsWith("QEMU", StringComparison.OrdinalIgnoreCase)) return true;
+            }
             RECT r;
             if (!GetWindowRect(h, out r)) return true;
             long area = (long)(r.R - r.L) * (r.B - r.T);
@@ -166,28 +189,38 @@ public class ApkAgent
     }
 
     // ------------------------------------------------------------------ embed / detach
-    static bool Embed(IntPtr host, IntPtr emu)
+    /// <summary>Attach the framebuffer and verify that Windows accepted its new parent.</summary>
+    /// <param name="host">ApkStart host window.</param>
+    /// <param name="emu">Selected emulator framebuffer.</param>
+    /// <returns>Zero on success, or the Win32 error code on failure.</returns>
+    static int Embed(IntPtr host, IntPtr emu)
     {
-        if (host == IntPtr.Zero || emu == IntPtr.Zero) return false;
-        HideToolWindows();
-        SetParent(emu, host);
-        uint style = (uint)GetWindowLong(emu, GWL_STYLE);
+        if (!IsWindow(host) || !IsWindow(emu)) return 1400;
+        int originalStyle = GetWindowLong(emu, GWL_STYLE);
+        uint style = (uint)originalStyle;
         style &= ~WS_POPUP;
         style &= ~(uint)(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU | WS_BORDER);
         style |= WS_CHILD | WS_CLIPCHILDREN | WS_CLIPSIBLINGS;
         SetWindowLong(emu, GWL_STYLE, (int)style);
+        SetParent(emu, host);
+        int error = Marshal.GetLastWin32Error();
+        if (GetAncestor(emu, 1) != host) // GA_PARENT: returns the parent, never the owner.
+        {
+            SetWindowLong(emu, GWL_STYLE, originalStyle);
+            return error != 0 ? error : 1400;
+        }
+        HideToolWindows();
         int ex = GetWindowLong(emu, GWL_EXSTYLE);
         ex &= ~(WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE);
         SetWindowLong(emu, GWL_EXSTYLE, ex);
-        return true;
+        return 0;
     }
 
-    // HWND_TOP: Chromium 的渲染子窗口和模拟器是同级的子窗口，
-    // 不主动抬到最前就会被 Chromium 那块黑底盖住（用户看到的就是黑屏）。
-    static readonly IntPtr HWND_TOP = new IntPtr(1);
+    // Raise the emulator above its Chromium sibling so the framebuffer is visible.
+    static readonly IntPtr HWND_TOP = IntPtr.Zero;
     static void Fit(int x, int y, int w, int h, bool frame)
     {
-        if (_emu == IntPtr.Zero) return;
+        if (_emu == IntPtr.Zero || _host == IntPtr.Zero) return;
         if (w < 16) w = 16;
         if (h < 16) h = 16;
         // SWP_FRAMECHANGED forces Windows to recompute the whole non-client area and
@@ -203,10 +236,14 @@ public class ApkAgent
         SetWindowPos(_emu, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     }
 
-    static void Detach()
+    /// <summary>Park the framebuffer as a hidden native window before its host closes.</summary>
+    /// <returns>Whether the host no longer owns the framebuffer.</returns>
+    static bool Detach()
     {
-        if (_emu == IntPtr.Zero) return;
+        if (_host == IntPtr.Zero || !IsWindow(_emu)) return true;
+        ShowWindow(_emu, 0);
         SetParent(_emu, IntPtr.Zero);
+        if (GetAncestor(_emu, 1) == _host) return false;
         uint style = (uint)GetWindowLong(_emu, GWL_STYLE);
         style &= ~WS_CHILD;
         style |= (uint)(WS_CAPTION | WS_THICKFRAME | WS_SYSMENU | WS_MINIMIZEBOX | WS_MAXIMIZEBOX);
@@ -214,19 +251,20 @@ public class ApkAgent
         int ex = GetWindowLong(_emu, GWL_EXSTYLE);
         ex |= WS_EX_APPWINDOW;
         SetWindowLong(_emu, GWL_EXSTYLE, ex);
-        SetWindowPos(_emu, IntPtr.Zero, 60, 40, 480, 853, SWP_NOZORDER | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
-        _emu = IntPtr.Zero;
+        SetWindowPos(_emu, IntPtr.Zero, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        _host = IntPtr.Zero;
+        _embedAt = 0;
+        return true;
     }
 
     // ------------------------------------------------------------------ rotation
-    // 模拟器的转屏是「改面板方向」，只有它自己的 Qt 快捷键 Ctrl+←/→ 会触发；
-    // 控制台命令 adb emu rotate 只是把画面转 90°，系统里仍然是竖屏（画面横躺）。
-    // 难点是快捷键必须由模拟器窗口收到键盘消息，而它已经是我们窗口的子窗口、
-    // 焦点在网页层。所以先把两个线程的输入队列接起来，把焦点临时给模拟器，
-    // 按完键再还回去。
+    // The Qt rotation shortcut changes the panel orientation. Attach the input queues
+    // to focus the embedded emulator for the shortcut, then restore focus to the host.
+    /// <summary>Send the rotation shortcut to the embedded emulator.</summary>
+    /// <param name="dir">Rotation direction: left or right.</param>
     static void Rotate(string dir)
     {
-        if (_emu == IntPtr.Zero) _emu = FindEmulator();
         if (_emu == IntPtr.Zero) return;
         IntPtr host = _host != IntPtr.Zero ? _host : GetParent(_emu);
 
@@ -419,8 +457,7 @@ public class ApkAgent
         if (_hook != IntPtr.Zero) { UnhookWindowsHookEx(_hook); _hook = IntPtr.Zero; }
         if (_hookTid != 0) PostThreadMessage(_hookTid, 0x0012, IntPtr.Zero, IntPtr.Zero); // WM_QUIT
         _hookThread = null;
-        // _hookProc 故意保留引用：钩子线程可能正在执行回调，提前置 null
-        // 会让委托被 GC 回收。线程退出时会自然释放。
+        // Keep the hook delegate alive while its thread may still be in the callback.
     }
 
     // ------------------------------------------------------------------ plumbing
@@ -469,8 +506,13 @@ public class ApkAgent
         catch { }
     }
 
+    /// <summary>Serve window commands using physical pixel coordinates on Windows.</summary>
+    /// <param name="port">Loopback port, or zero to let Windows select a port.</param>
     public static void Serve(int port)
     {
+        // Electron sends physical pixels. Avoid DPI virtualization in PowerShell 5.1.
+        try { SetThreadDpiAwarenessContext(new IntPtr(-4)); } // Per-monitor aware v2.
+        catch (EntryPointNotFoundException) { }
         TcpListener l = new TcpListener(IPAddress.Loopback, port);
         l.Start();
         int actual = ((IPEndPoint)l.LocalEndpoint).Port;
@@ -497,6 +539,16 @@ public class ApkAgent
             // first few seconds after an embed, then stop: a permanent 2s EnumWindows +
             // SetWindowPos loop is pure overhead and competes with the foreground app.
             long now = Environment.TickCount;
+            if (_parkPort > 0 && now - _lastPark >= 20)
+            {
+                _lastPark = now;
+                IntPtr waiting = FindEmulator(_parkPort, 0);
+                if (waiting != IntPtr.Zero && IsWindowVisible(waiting))
+                {
+                    ShowWindow(waiting, 0);
+                    HideToolWindows();
+                }
+            }
             if (_embedAt != 0 && now - _embedAt < 8000 && now - _lastToolSweep > 1500)
             {
                 _lastToolSweep = now;
@@ -509,7 +561,11 @@ public class ApkAgent
             {
                 // Short poll: keep the message pump responsive even when no command
                 // arrives. Never block for seconds while owning window hooks.
-                if (!sock.Poll(50, SelectMode.SelectRead)) continue;
+                if (!sock.Poll(50, SelectMode.SelectRead))
+                {
+                    if (_parkPort > 0) Thread.Sleep(5);
+                    continue;
+                }
                 int n = sock.Receive(buf);
                 if (n <= 0) break;
                 rx.Append(Encoding.UTF8.GetString(buf, 0, n));
@@ -525,17 +581,39 @@ public class ApkAgent
                     string cmd = S(line, "cmd");
                     if (cmd == "embed")
                     {
-                        _host = new IntPtr(L(line, "host"));
-                        _emu = FindEmulator();
-                        bool ok = Embed(_host, _emu);
+                        IntPtr host = new IntPtr(L(line, "host"));
+                        long consolePort = L(line, "port");
+                        long pid = L(line, "pid");
+                        IntPtr emu = FindEmulator(consolePort, pid);
+                        if (emu == IntPtr.Zero)
+                        {
+                            Reply(sock, "{\"ok\":false,\"error\":\"no-window\"}");
+                            continue;
+                        }
+                        int error = Embed(host, emu);
+                        if (error != 0)
+                        {
+                            Reply(sock, "{\"ok\":false,\"error\":\"set-parent-failed\",\"win32\":" + error + "}");
+                            continue;
+                        }
+                        _host = host;
+                        _emu = emu;
+                        _emuPort = consolePort;
+                        _emuPid = pid;
+                        if (_parkPort == consolePort) _parkPort = 0;
                         _embedAt = Environment.TickCount;
                         _lastToolSweep = 0;
                         Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), true);
-                        Reply(sock, "{\"ok\":" + (ok ? "true" : "false") + ",\"emu\":" + _emu.ToInt64() + "}");
+                        Reply(sock, "{\"ok\":true,\"emu\":" + _emu.ToInt64() + "}");
+                    }
+                    else if (cmd == "park")
+                    {
+                        _parkPort = L(line, "port");
+                        _lastPark = Environment.TickCount - 20;
+                        Reply(sock, "{\"ok\":true}");
                     }
                     else if (cmd == "fit")
                     {
-                        if (_emu == IntPtr.Zero) _emu = FindEmulator();
                         Fit((int)L(line, "x"), (int)L(line, "y"), (int)L(line, "w"), (int)L(line, "h"), false);
                         Reply(sock, "{\"ok\":true}");
                     }
@@ -552,13 +630,12 @@ public class ApkAgent
                     }
                     else if (cmd == "show")
                     {
-                        if (_emu != IntPtr.Zero) ShowWindow(_emu, 5);
+                        if (_emu != IntPtr.Zero && _host != IntPtr.Zero) ShowWindow(_emu, 5);
                         Reply(sock, "{\"ok\":true}");
                     }
                     else if (cmd == "detach")
                     {
-                        Detach();
-                        Reply(sock, "{\"ok\":true}");
+                        Reply(sock, Detach() ? "{\"ok\":true}" : "{\"ok\":false}");
                     }
                     else if (cmd == "hook")
                     {
@@ -572,7 +649,7 @@ public class ApkAgent
                     }
                     else if (cmd == "probe")
                     {
-                        IntPtr e = FindEmulator();
+                        IntPtr e = FindEmulator(L(line, "port"), L(line, "pid"));
                         RECT r = new RECT();
                         if (e != IntPtr.Zero) GetWindowRect(e, out r);
                         Reply(sock, "{\"ok\":true,\"emu\":" + e.ToInt64() + ",\"w\":" + (r.R - r.L) + ",\"h\":" + (r.B - r.T) + "}");

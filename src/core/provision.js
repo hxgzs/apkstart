@@ -115,6 +115,19 @@ class Provisioner {
     return r && r.trim() ? r : path.join(store.DATA_DIR, 'runtime');
   }
 
+  /**
+   * 返回可用的 Emulator 路径。便携包随附的版本优先，ADB 和系统镜像仍沿用现有目录。
+   * @returns {string} 选中的 Emulator 路径，未部署时为空。
+   */
+  emulatorExecutable() {
+      const candidates = [
+          path.join(this.appRoot, '..', 'runtime', 'emulator', 'emulator.exe'),
+          this.paths().emulatorExe,
+          path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe'),
+      ];
+      return candidates.find((candidate) => fs.existsSync(candidate)) || '';
+  }
+
   paths() {
     const root = this.root;
     const sysTag = DEFAULT_SYSIMG.tag;
@@ -440,11 +453,8 @@ class Provisioner {
     if (this._cache.emulatorVersion && this._cache.emulatorVerAt && Date.now() - this._cache.emulatorVerAt < 30000) {
       return this._cache.emulatorVersion;
     }
-    const p = this.paths();
-    const candidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe')];
-    for (const c of candidates) {
-      if (!fs.existsSync(c)) continue;
-      // eslint-disable-next-line no-await-in-loop
+    const c = this.emulatorExecutable();
+    if (c) {
       const r = await run(c, ['-version'], { timeout: 20000 });
       const text = `${r.stdout}${r.stderr}`;
       const m = /Android emulator version\s+([\d.]+)/i.exec(text);
@@ -589,9 +599,8 @@ class Provisioner {
       return this._cache.accel;
     }
     const p = this.paths();
-    const exe = fs.existsSync(p.emulatorExe) ? p.emulatorExe
-      : path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe');
-    if (!fs.existsSync(exe)) return { ok: false, kind: 'none', note: '未安装 emulator' };
+    const exe = this.emulatorExecutable();
+    if (!exe) return { ok: false, kind: 'none', note: '未安装 emulator' };
 
     const aehdSys = path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'drivers', 'aehd.sys');
     const hasAehdFile = fs.existsSync(aehdSys) || fs.existsSync(path.join(p.aehdDir, 'aehd.sys'));

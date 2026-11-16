@@ -355,21 +355,33 @@ class Installer {
     return true;
   }
 
-  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {} } = {}) {
+  /**
+   * 启动已安装应用并等待其前台窗口绘制，返回应用实际所在的设备。
+   * @param {string} pkg 应用包名。
+   * @param {object} options 启动回调。
+   * @param {Function} [options.onLog] 输出运行时日志。
+   * @param {Function} [options.beforeStart] 启动 Activity 前准备运行时。
+   * @param {Function} [options.onMark] 记录启动阶段。
+   * @param {boolean} [options.landscape] 是否使用横屏运行时。
+   * @returns {Promise<object>} 启动结果及设备序列号。
+   */
+  async launch(pkg, { onLog = () => {}, beforeStart = null, onMark = () => {}, landscape = false } = {}) {
     const app = store.getApp(pkg);
-    const rt = await this.runtime.ensure({ onLog });
+    const rt = await this.runtime.ensure({ onLog, landscape });
     onMark('ensure done');
     if (!rt.ok) {
       const err = new Error(rt.error || '运行时不可用');
       err.needsSetup = rt.needsSetup;
       throw err;
     }
+    let launchedRuntime = rt;
     // 分辨率要在拉起应用之前改，避免 wm size 触发配置变更把刚启动的 Activity 重建
     if (beforeStart) await beforeStart(rt).catch((e) => onLog(`显示适配跳过：${e.message}`));
     const settings = store.getSettings();
     const start = () => rt.client.startApp(app ? app.package : pkg, app ? app.activity : null, {
       freeform: settings.freeform,
       bounds: app ? app.bounds : null,
+      waitForDraw: true,
     });
     // 应用可能还没装进当前运行时（镜像重建 / 清过数据 / 首次），直接拉起会报
     // "Invalid packageName"。先在本地缓存里把它装上再启动，这样「点开应用」永远能进，
@@ -381,29 +393,6 @@ class Installer {
         await rt.client.install(app.apkPath).catch((e) => onLog(`自动安装失败：${e.message}`));
       }
     }
-    // 观察 25 秒并要求「连续存活 5 秒」才算启动成功。
-    // 关键：进程"还没起来"和"起来过又没了"必须分开看。以前一看到 pidof 为空就判失败，
-    // 结果大型应用（红果这种首启要十几秒的）在加载途中就被 force-stop 重启，
-    // 反复三轮才勉强起来，用户感知就是"点了要等一分钟"。
-    const staysAlive = async () => {
-      const t0 = Date.now();
-      let aliveSince = 0;
-      let seen = false;
-      while (Date.now() - t0 < 25000) {
-        // eslint-disable-next-line no-await-in-loop
-        await sleep(1000);
-        // eslint-disable-next-line no-await-in-loop
-        const pid = await rt.client.shell(`pidof ${pkg}`, { timeout: 6000 }).catch(() => '');
-        if (!String(pid).trim()) {
-          if (seen) return false; // 起来过又消失 = 真的崩了
-          continue; // 还在加载，继续等
-        }
-        seen = true;
-        if (!aliveSince) aliveSince = Date.now();
-        if (Date.now() - aliveSince >= 5000) return true;
-      }
-      return seen; // 一直没见过进程才算失败
-    };
     try {
       // 先确保运行时权限齐备：安装时的 -g 在清过数据后可能失效，
       // 缺权限时应用会被系统授权框挡住，用户看到的就是「点了没反应/打不开」。
@@ -428,13 +417,12 @@ class Installer {
           await start();
         } catch (e) {
           // 有明确崩溃日志才交给外层（可能要切兼容镜像）；没有证据多半只是启动慢，重试即可
-          if (e.code === 'APP_CRASHED' && e.crash) throw e;
+          if ((e.code === 'APP_CRASHED' && e.crash) || e.code === 'APP_NO_FRAME') throw e;
           started = false;
         }
         onMark(`am start #${attempt} ${started ? 'ok' : 'fail'}`);
         // eslint-disable-next-line no-await-in-loop
-        ok = started ? await staysAlive() : false;
-        onMark(`alive #${attempt} ${ok}`);
+        ok = started;
         if (!ok && attempt < 3) onLog(`应用启动后退出（第 ${attempt} 次），正在自动重试…`);
       }
       if (!ok) {
@@ -445,11 +433,8 @@ class Installer {
         await sleep(800);
         // pm clear 会把运行时权限一并清掉，必须重新授，否则会卡在系统授权框
         await rt.client.grantRuntimePermissions(pkg).catch(() => {});
-        await start().catch((e) => {
-          if (e.code === 'APP_CRASHED' && e.crash) throw e;
-        });
-        ok = await staysAlive();
-        if (!ok) await rt.client.dismissPermissionDialog().catch(() => {});
+        await start();
+        ok = true;
       }
       if (!ok) {
         const err = new Error('应用启动后立即退出，已自动重试并重置应用数据仍未成功');
@@ -468,7 +453,9 @@ class Installer {
         await rt2.client.startApp(app ? app.package : pkg, app ? app.activity : null, {
           freeform: settings.freeform,
           bounds: app ? app.bounds : null,
+          waitForDraw: true,
         });
+        launchedRuntime = rt2;
       } else {
         throw e;
       }
@@ -481,7 +468,7 @@ class Installer {
         lastLaunchAt: Date.now(),
       });
     }
-    return { ok: true, engine: rt.engine };
+    return { ok: true, engine: launchedRuntime.engine, client: launchedRuntime.client, serial: launchedRuntime.client.serial };
   }
 }
 

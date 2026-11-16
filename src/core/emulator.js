@@ -18,7 +18,16 @@ const { Provisioner } = require('./provision');
 const doctor = require('./doctor');
 
 const AVD_NAME = 'apkstart';
-const SNAPSHOT_NAME = 'apkstart';
+const SNAPSHOT_NAME = 'apkstart-gles';
+// 避开 Windows 快照加载时恢复 Goldfish 共享图形内存的路径，
+// 保留宿主 GLES 渲染与 WHPX，解码模式也纳入快照指纹。
+const GRAPHICS_FEATURES = process.platform === 'win32'
+    ? '-Vulkan,-HasSharedSlotsHostMemoryAllocator,-GLDMA,-GLDMA2,-WindowsOnDemandSnapshotLoad'
+    : '-Vulkan';
+const EXPERIMENTAL_DECODER_VERSION = /^36\.4\.9(?:\.0)?$/;
+const SNAPSHOT_PROFILE_FILE = 'apkstart-profile';
+const SNAPSHOT_BOOT_TIMEOUT_MS = 30000;
+const SNAPSHOT_SAVE_TIMEOUT_MS = 45000;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -29,13 +38,14 @@ class EmulatorEngine {
     this.proc = null;
     this._log = [];
     this.port = 5554;
+    this.parkWindow = null;
     this.adbPort = Number(process.env.ANDROID_ADB_SERVER_PORT) || 5044;
     this.profile = null;
     this.attempts = [];
     this.lastDiagnosis = null;
-    // 快照的 ram.bin ≈ 分配给虚拟机的内存（2-4GB）。
-    // 冷启动本来就快的机器不该为它付出几个 GB 的磁盘，只在「真慢」时才保存。
-    this.snapshotWorthSaving = null;
+    this.snapshotReady = false;
+    this.snapshotSave = null;
+    this.stopping = null;
   }
 
   log(line) {
@@ -50,10 +60,9 @@ class EmulatorEngine {
   /** emulator.exe 与系统镜像目录（优先用户运行时目录，回退到仓库内 engine/） */
   locate() {
     const p = this.provisioner.paths();
-    const emuCandidates = [p.emulatorExe, path.join(this.appRoot, 'engine', 'emulator', 'emulator.exe')];
-    const emulatorExe = emuCandidates.find((c) => fs.existsSync(c)) || '';
+    const emulatorExe = this.provisioner.emulatorExecutable();
     const img = this.provisioner.systemImageInfo();
-    return { emulatorExe, sysImgDir: img.dir, sysImgOk: img.ok, root: emulatorExe ? path.dirname(path.dirname(emulatorExe)) : p.root };
+    return { emulatorExe, sysImgDir: img.dir, sysImgOk: img.ok, root: p.root };
   }
 
   /** 选镜像：有通用镜像（API 34 Play）就用它，不再让用户切「兼容模式」 */
@@ -98,14 +107,44 @@ class EmulatorEngine {
     } catch (_) { /* ignore */ }
   }
 
-  /** AVD 目录里是否真的有一份 quickboot 快照 */
-  hasSnapshot() {
+  /**
+   * 检查当前命名快照是否包含可恢复的元数据和内存文件。
+   * @param {boolean} [checkProfile] 是否要求快照与当前运行时配置一致。
+   * @returns {boolean} 当前快照是否值得尝试加载。
+   */
+  hasSnapshot(checkProfile = true) {
     try {
-      const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots');
-      return fs.readdirSync(dir).length > 0;
+        const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots', SNAPSHOT_NAME);
+        const meta = fs.statSync(path.join(dir, 'snapshot.pb'), { throwIfNoEntry: false });
+        const memory = ['ram.bin', 'ram.img'].some((file) => {
+            const stat = fs.statSync(path.join(dir, file), { throwIfNoEntry: false });
+            return stat?.isFile() && stat.size > 0;
+        });
+        if (!(meta?.isFile() && meta.size > 0 && memory)) return false;
+        return !checkProfile || !this.currentSnapshotKey
+            || fs.readFileSync(path.join(dir, SNAPSHOT_PROFILE_FILE), 'utf8') === this.currentSnapshotKey;
     } catch (_) {
-      return false;
+        return false;
     }
+  }
+
+  /**
+   * 移开恢复失败的快照，保留其文件供诊断，并让下次启动跳过它。
+   * @returns {Promise<boolean>} 快照是否已移开。
+   */
+  async archiveFailedSnapshot() {
+    const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots', SNAPSHOT_NAME);
+    const archive = `${dir}.failed-${Date.now()}`;
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+        try {
+            await fs.promises.rename(dir, archive);
+            return true;
+        } catch (error) {
+            if (error.code === 'ENOENT') return true;
+            if (attempt < 2) await sleep(750);
+        }
+    }
+    return false;
   }
 
   /**
@@ -159,10 +198,12 @@ class EmulatorEngine {
 
   /**
    * 准备 AVD：写 config.ini。每次启动按当前自动配置重写，保证降级重试即时生效。
+   * @param {object} options 内存、核心数、图形后端、分区、加速、快照和屏幕选项。
+   * @returns {object} AVD 路径和本次开机配置。
    */
   ensureAvd({
     memoryMB = 2048, cores = 2, gpu = 'software', dataMB = 4096,
-    heapMB = 256, accel = 'auto', snapshot = true, wipe = false, lcd = null,
+    heapMB = 256, accel = 'auto', snapshot = true, wipe = false, lcd = null, hardwareDecode = false,
   } = {}) {
     const p = this.provisioner.ensureDirs();
     const home = p.avdHome;
@@ -200,13 +241,13 @@ class EmulatorEngine {
     }
 
     // 配置指纹变化 → 旧 quickboot 快照必然加载失败或产生黑屏，主动作废
-    const key = `${doctor.snapshotKey({
+    const dataKey = doctor.snapshotKey({
       dataMB, emulatorVersion: this._emuVersion || '', api, tag,
-    }, choice.dir)}|${screen.w}x${screen.h}@${screen.dpi}`;
+    }, choice.dir);
+    const key = `${dataKey}|${screen.w}x${screen.h}@${screen.dpi}`;
     const keyFile = path.join(avdDir, 'snapshot.key');
-    let prevKey = '';
-    try { prevKey = fs.readFileSync(keyFile, 'utf8').trim(); } catch (_) { /* 首次 */ }
-    if (prevKey && prevKey !== key) this.wipePending = true;
+    // Emulator 版本变化只影响快照兼容性，已有 Android 数据由镜像配置判断是否兼容。
+    this.currentSnapshotKey = [key, gpu, accel, memoryMB, cores, this.graphicsFeatures(hardwareDecode)].join('|');
     if (this.wipePending || wipe) {
       // 删除可能被系统/安全软件拦截（快照目录常有几个 GB）。
       // 失败就改名让 emulator 不再加载它，绝不因为清理失败而中断启动。
@@ -244,6 +285,7 @@ class EmulatorEngine {
       'hw.lcd.width=' + screen.w,
       'hw.lcd.height=' + screen.h,
       'hw.lcd.density=' + screen.dpi,
+      `hw.initialOrientation=${screen.w > screen.h ? 'landscape' : 'portrait'}`,
       'hw.mainKeys=no',
       'ShowDeviceFrame=no',
       `PlayStore.enabled=${choice.compat}`,
@@ -283,10 +325,25 @@ class EmulatorEngine {
     };
   }
 
+    /**
+     * 生成与快照指纹共用的图形功能参数。
+     * @param {boolean} hardwareDecode 是否启用宿主视频解码。
+     * @returns {string} 模拟器的 feature 参数。
+     */
+    graphicsFeatures(hardwareDecode) {
+        if (process.platform !== 'win32') return GRAPHICS_FEATURES;
+        return `${GRAPHICS_FEATURES},${hardwareDecode ? 'HardwareDecoder' : '-HardwareDecoder'}`;
+    }
+
+  /**
+   * 构造模拟器命令行。
+   * @param {object} options 显示、解码和虚拟机配置。
+   * @returns {string[]} 模拟器参数。
+   */
   buildArgs({
     headless = true, accel = 'auto', port = 5554,
     gpu = 'software', memoryMB = 2048, cores = 2,
-    snapshot = true, wipe = false, lcd = null,
+    snapshot = true, wipe = false, lcd = null, hardwareDecode = false,
   } = {}) {
     const args = [
       '-avd', AVD_NAME,
@@ -300,6 +357,7 @@ class EmulatorEngine {
       // 主线程被卡住、永远不开机（日志表现为 Showing crashdialog to get consent）。
       '-crash-report-mode', 'disabled',
       '-gpu', gpu,
+      '-feature', this.graphicsFeatures(hardwareDecode),
       '-memory', String(memoryMB),
       '-cores', String(cores),
     ];
@@ -320,8 +378,10 @@ class EmulatorEngine {
     // qemu 会一直等一份不存在的内存状态，进程活着但永远不开机——
     // 上层只看到「开机超时」，接着换参数重试，反而被 AVD 锁挡成
     // "Running multiple emulators with the same AVD"。
+    // 只禁用模拟器退出时默认的自动保存。冷启仍允许用控制台显式保存命名快照。
+    args.push('-no-snapshot-save');
     if (snapshot && !wipe && this.hasSnapshot()) args.push('-snapshot', SNAPSHOT_NAME);
-    else args.push('-no-snapshot');
+    else args.push('-no-snapshot-load');
     if (wipe) args.push('-wipe-data');
     if (accel === 'off') args.push('-accel', 'off');
     return args;
@@ -334,7 +394,7 @@ class EmulatorEngine {
     const args = this.buildArgs({
       headless, accel: plan.accel, port: plan.port, gpu: plan.gpu,
       memoryMB: plan.memoryMB, cores: plan.cores,
-      snapshot: plan.snapshot, wipe: plan.wipe, lcd: plan.lcd,
+      snapshot: plan.snapshot, wipe: plan.wipe, lcd: plan.lcd, hardwareDecode: plan.hardwareDecode,
     });
     fs.appendFileSync(logFile, `\n--- ${new Date().toISOString()} ${plan.label} ---\n${loc.emulatorExe} ${args.join(' ')}\n`);
 
@@ -350,6 +410,9 @@ class EmulatorEngine {
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     this.proc = proc;
+    this.hardwareDecode = plan.hardwareDecode;
+    this.snapshotReady = false;
+    const attempt = { proc, args, snapshotFailed: false };
     try { proc.unref(); } catch (_) { /* ignore */ }
 
     const pipe = (stream) => {
@@ -361,6 +424,7 @@ class EmulatorEngine {
         buf = lines.pop() || '';
         for (const l of lines) {
           if (!l.trim()) continue;
+          if (l.includes(`Failed to load snapshot '${SNAPSHOT_NAME}'`)) attempt.snapshotFailed = true;
           this.log(l.trim());
           fs.appendFileSync(logFile, `${l.trim()}\n`);
         }
@@ -371,13 +435,13 @@ class EmulatorEngine {
     proc.on('exit', (code) => {
       this.log(`emulator exit ${code}`);
       fs.appendFileSync(logFile, `emulator exit ${code}\n`);
-      this.proc = null;
+      if (this.proc === proc) this.proc = null;
       onLog(`运行时已退出（code=${code}）`);
     });
     proc.on('error', (e) => {
       this.log(`spawn error: ${e.message}`);
       fs.appendFileSync(logFile, `spawn error: ${e.message}\n`);
-      this.proc = null;
+      if (this.proc === proc) this.proc = null;
     });
 
     // qemu 是 detached 的独立进程，等它真正起来再把优先级降下来。
@@ -387,7 +451,7 @@ class EmulatorEngine {
     setTimeout(() => {
       this.setPriority(perf ? 'normal' : 'below').catch(() => {});
     }, 3500).unref?.();
-    return { proc, args };
+    return attempt;
   }
 
   /**
@@ -429,7 +493,17 @@ class EmulatorEngine {
    * 启动 + 自动重试。
    * @param {Function} probe 异步回调，返回 'ok' | 'pending' | 'fatal'
    */
-  async start({ headless = false, onLog = () => {}, probe = null, maxAttempts = 4 } = {}) {
+  /**
+   * 启动自带模拟器并等待 Android 就绪。
+   * @param {object} options 开机选项。
+   * @param {boolean} [options.headless] 是否禁用宿主窗口。
+   * @param {boolean} [options.landscape] 是否使用原生横屏尺寸。
+   * @param {Function} [options.onLog] 进度回调。
+   * @param {Function} [options.probe] Android 就绪探测回调。
+   * @param {number} [options.maxAttempts] 启动尝试上限。
+   * @returns {Promise<object>} 可用的模拟器设备信息。
+   */
+  async start({ headless = false, landscape = false, onLog = () => {}, probe = null, maxAttempts = 4 } = {}) {
     if (this.proc && !this.proc.killed) {
       return { ok: true, reused: true, serial: this.serial, port: this.port };
     }
@@ -451,12 +525,11 @@ class EmulatorEngine {
     // 让本进程里所有 adb 调用和 emulator 用同一个 server 端口
     process.env.ANDROID_ADB_SERVER_PORT = String(adbPort);
     this.adbPort = adbPort;
-    // 端口固定了，上一次运行留下的 server 可能还挂着旧设备记录，先清一次再起，
-    // 否则新模拟器注册时会被旧记录挤成 offline。
+    // 确保专用 adb server 在 QEMU 启动前已经就绪，快照恢复时才能及时重新注册设备。
     await new Promise((resolve) => {
       try {
         const adb = this.provisioner.adbVersionPath() || 'adb';
-        execFile(adb, ['kill-server'], {
+        execFile(adb, ['-P', String(adbPort), 'start-server'], {
           timeout: 6000, windowsHide: true,
           env: { ...process.env, ANDROID_ADB_SERVER_PORT: String(adbPort) },
         }, () => resolve());
@@ -476,10 +549,16 @@ class EmulatorEngine {
     fs.appendFileSync(logFile, `\n\n=== ${new Date().toISOString()} START ${doctor.describeProfile(profile)} ===\n`);
 
     // 屏幕规格在整个启动过程中保持一致，否则每次重试都换分辨率会狂清快照
-    const screen = doctor.lcdFor({ accelOk: accelInfo.ok });
+    const portrait = doctor.lcdFor({ accelOk: accelInfo.ok });
+    const screen = landscape ? { ...portrait, w: portrait.h, h: portrait.w } : portrait;
     this.attempts = [];
     this.lastDiagnosis = null;
     let lastError = '';
+    let skipSnapshot = landscape;
+    // 只有显式启用实验选项才试用硬解。实机上 36.4.9 仍可能保存无法恢复的设备状态。
+    const decoderEligible = process.env.APKSTART_EXPERIMENTAL_HW_DECODE === '1'
+        && process.platform === 'win32' && !headless && EXPERIMENTAL_DECODER_VERSION.test(emuVersion);
+    let decoderRejected = s.engine?.decoderRejectedVersion === emuVersion;
 
     // 冷启前先清孤儿：上一次运行留下的 qemu 仍占着 AVD 锁时，
     // 所有尝试都会立刻 FATAL "Running multiple emulators with the same AVD"。
@@ -491,8 +570,13 @@ class EmulatorEngine {
       // 端口占用也会导致失败，每次重试重新探测一次
       // eslint-disable-next-line no-await-in-loop
       const port = i === 0 ? startPort : await doctor.freePortPair(startPort + (i * 2));
-      const plan = { ...base, port, adbPort, lcd: screen };
+      const plan = {
+          ...base, port, adbPort, lcd: screen,
+          hardwareDecode: decoderEligible && !decoderRejected && base.gpu === 'host',
+      };
+      if (skipSnapshot) plan.snapshot = false;
       this.port = port;
+      if (this.parkWindow && !headless) await this.parkWindow(port);
       onLog(`启动运行时（第 ${i + 1}/${variants.length} 次：${plan.label}）…`);
 
       // eslint-disable-next-line no-await-in-loop
@@ -500,13 +584,24 @@ class EmulatorEngine {
         ...plan,
         wipe: plan.wipe || !!this.wipePending,
       });
+      const restoring = plan.snapshot && !plan.wipe && !avd.wipePending && this.hasSnapshot();
       // eslint-disable-next-line no-await-in-loop
-      this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending }, { headless, onLog, logFile });
+      if (restoring) onLog('正在恢复安卓运行时快照…');
+      const attempt = this.spawnOnce({ ...plan, wipe: plan.wipe || avd.wipePending }, { headless, onLog, logFile });
 
       // 参数错误 / DLL 缺失会立刻退出
       // eslint-disable-next-line no-await-in-loop
       await sleep(2500);
       if (!this.proc) {
+        if (restoring) {
+            skipSnapshot = true;
+            onLog('快照恢复时运行时退出，正在冷启动重试…');
+            await this.killAttempt();
+            await this.archiveFailedSnapshot();
+            if (plan.hardwareDecode) decoderRejected = this.rejectHardwareDecoder(onLog);
+            i -= 1;
+            continue;
+        }
         const d = doctor.diagnose(this.recentLog(60));
         this.attempts.push({ plan: plan.label, diagnosis: d.code });
         this.lastDiagnosis = d;
@@ -520,18 +615,19 @@ class EmulatorEngine {
       }
 
       const started = Date.now();
-      const timeout = plan.bootTimeoutMs || 240000;
+      const timeout = restoring ? SNAPSHOT_BOOT_TIMEOUT_MS : (plan.bootTimeoutMs || 240000);
       let ok = false;
       let fatal = false;
       let sawBooting = false;
       // eslint-disable-next-line no-await-in-loop
       while (Date.now() - started < timeout) {
-        if (!this.proc) { fatal = true; break; }
+        if (!this.proc || (restoring && attempt.snapshotFailed)) { fatal = true; break; }
         let state = 'pending';
         try {
           // eslint-disable-next-line no-await-in-loop
           state = await probe({ serial: this.serial, port, adbPort });
         } catch (_) { state = 'pending'; }
+        if (restoring && attempt.snapshotFailed) { fatal = true; break; }
         if (state === 'ok') { ok = true; break; }
         if (state === 'fatal') { fatal = true; break; }
         // 只要 adb 能执行 shell，说明内核已经在引导，日志里的普通 Vulkan/EGL 信息不算失败
@@ -553,17 +649,23 @@ class EmulatorEngine {
 
       if (ok) {
         const bootMs = Date.now() - started;
-        // 一定要存 quickboot 快照：模拟器进程会随 ApkStart 退出而结束（Electron 的
-        // job 对象会连带杀掉子进程），下次打开有没有快照直接决定是 25 秒还是 7 秒。
-        // 装完新应用时 installer 会作废快照，避免"重启后应用消失"。
-        this.snapshotWorthSaving = true;
-        onLog(`运行时就绪（${Math.round(bootMs / 1000)}s，${plan.label}）`);
+        this.snapshotReady = true;
+        onLog(`${restoring ? '快照恢复后运行时就绪' : '运行时就绪'}（${Math.round(bootMs / 1000)}s，${plan.label}）`);
         return {
           ok: true, serial: this.serial, port, accel: accelInfo, logFile,
           profile, attempts: this.attempts, bootMs, quickBoot: true,
         };
       }
 
+      if (restoring) {
+          skipSnapshot = true;
+          onLog('快照恢复后 Android 未就绪，正在冷启动重试…');
+          await this.killAttempt();
+          await this.archiveFailedSnapshot();
+          if (plan.hardwareDecode) decoderRejected = this.rejectHardwareDecoder(onLog);
+          i -= 1;
+          continue;
+      }
       const d = fatal ? (this.lastDiagnosis || doctor.diagnose(this.recentLog(80))) : doctor.diagnose(this.recentLog(80));
       this.attempts.push({ plan: plan.label, diagnosis: d.code, timeout: !fatal });
       this.lastDiagnosis = d;
@@ -591,44 +693,104 @@ class EmulatorEngine {
 
   running() { return !!(this.proc && !this.proc.killed); }
 
+    /**
+     * 为本机当前模拟器版本记录硬解快照失败，后续启动使用兼容解码。
+     * @param {Function} onLog 启动日志回调。
+     * @returns {boolean} 当前启动也应禁用硬解。
+     */
+    rejectHardwareDecoder(onLog) {
+        try { store.saveSettings({ engine: { decoderRejectedVersion: this._emuVersion } }); }
+        catch (error) { this.log(`记录视频解码兼容配置失败：${error.message}`); }
+        onLog('宿主视频解码快照恢复失败，正在切换到兼容解码');
+        return true;
+    }
+
   /**
-   * 开机成功后顺手存一份 quickboot 快照。
-   * 模拟器进程活不过 ApkStart（Electron 退出会连带清理子进程），所以不能指望
-   * "退出时再存"；开机完趁系统干净存一份，下次打开直接 7 秒进桌面而不是 25 秒。
-   * 装新应用后 installer 会作废快照，不用担心应用消失。
+   * 供无桌面托盘的 CLI 在开机后预存快照。
+   * @param {string} adbPath ADB 可执行文件。
    */
   saveSnapshotSoon(adbPath) {
-    if (this._snapQueued || !adbPath) return;
+    if (this.hardwareDecode || this._snapQueued || !adbPath) return;
     this._snapQueued = true;
-    const serial = this.serial;
     setTimeout(() => {
-      execFile(adbPath, ['-s', serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
-        { timeout: 60000, windowsHide: true }, () => { /* 存不上就算了，下次照常冷启动 */ });
+        this._snapQueued = false;
+        if (!this.stopping) this.saveSnapshot(adbPath);
     }, 6000).unref?.();
   }
 
-  /** 优雅停止：慢机器先保存 quickboot 快照，再走控制台关机，最后强杀进程树 */
-  async stop({ adbPath } = {}) {
-    if (!this.proc) return true;
-    const serial = this.serial;
-    if (adbPath && this.snapshotWorthSaving !== false) {
-      await new Promise((resolve) => {
-        execFile(adbPath, ['-s', serial, 'emu', 'avd', 'snapshot', 'save', SNAPSHOT_NAME],
-          { timeout: 8000, windowsHide: true }, () => resolve());
+  /**
+   * 向当前内置模拟器控制台发送命令，等待最终的 OK。
+   * @param {string} adbPath ADB 可执行文件。
+   * @param {string[]} args 模拟器控制台命令和参数。
+   * @param {number} timeout 命令最长等待时间，单位为毫秒。
+   * @returns {Promise<boolean>} 控制台是否确认命令成功。
+   */
+  consoleCommand(adbPath, args, timeout) {
+      return new Promise((resolve) => {
+          execFile(adbPath, ['-P', String(this.adbPort), '-s', this.serial, 'emu', ...args],
+              { timeout, windowsHide: true }, (error, stdout) => {
+                  const lines = String(stdout).trim().split(/\r?\n/);
+                  resolve(!error && lines.at(-1) === 'OK' && !lines.some((line) => /^KO\b/i.test(line)));
+              });
       });
-    }
-    if (adbPath) {
-      await new Promise((resolve) => {
-        execFile(adbPath, ['-s', serial, 'emu', 'kill'],
-          { timeout: 8000, windowsHide: true }, () => resolve());
-      });
-    }
-    for (let i = 0; i < 20 && this.proc; i += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      await sleep(300);
-    }
-    await this.killAttempt();
-    return true;
+  }
+
+  /**
+   * 保存已就绪的 Android，并确认控制台响应和磁盘快照均有效。
+   * @param {string} adbPath ADB 可执行文件。
+   * @returns {Promise<boolean>} 是否保存了可供下次加载的快照。
+   */
+  async saveSnapshot(adbPath) {
+      if (this.snapshotSave) return this.snapshotSave;
+      if (!adbPath || !this.snapshotReady || !this.running()) return false;
+      this.snapshotSave = (async () => {
+          const accepted = await this.consoleCommand(adbPath, ['avd', 'snapshot', 'save', SNAPSHOT_NAME], SNAPSHOT_SAVE_TIMEOUT_MS);
+          if (!accepted || !this.currentSnapshotKey || !this.hasSnapshot(false)) return false;
+          const dir = path.join(this.provisioner.paths().avdHome, `${AVD_NAME}.avd`, 'snapshots', SNAPSHOT_NAME);
+          await fs.promises.writeFile(path.join(dir, SNAPSHOT_PROFILE_FILE), this.currentSnapshotKey, 'utf8');
+          return true;
+      })();
+      try {
+          return await this.snapshotSave;
+      } finally {
+          this.snapshotSave = null;
+      }
+  }
+
+  /**
+   * 先保存已就绪的内置模拟器，再关闭进程。并发停止请求共用一次保存。
+   * @param {object} [options] 停止选项。
+   * @param {string} [options.adbPath] ADB 可执行文件。
+   * @param {boolean} [options.saveSnapshot] 是否为下次启动保存快照。
+   * @param {Function} [options.onLog] 接收快照保存进度的回调。
+   * @returns {Promise<boolean>} 停止完成后返回。
+   */
+  async stop({ adbPath, saveSnapshot = true, onLog = () => {} } = {}) {
+      if (this.stopping) return this.stopping;
+      if (!this.proc) return true;
+      this.stopping = (async () => {
+          let saved = false;
+          if (saveSnapshot && this.snapshotReady) {
+              const start = Date.now();
+              onLog('正在保存安卓运行时快照…');
+              saved = await this.saveSnapshot(adbPath).catch(() => false);
+              if (saved) onLog(`安卓运行时快照已保存（${Date.now() - start}ms）`);
+          }
+          if (adbPath) await this.consoleCommand(adbPath, ['kill'], 8000);
+          for (let i = 0; i < 20 && this.proc; i += 1) await sleep(300);
+          await this.killAttempt();
+          if (saveSnapshot && this.snapshotReady && !saved) {
+              await this.archiveFailedSnapshot();
+              onLog('快照未能完整保存，下次将冷启动');
+          }
+          this.snapshotReady = false;
+          return true;
+      })();
+      try {
+          return await this.stopping;
+      } finally {
+          this.stopping = null;
+      }
   }
 
   recentLog(n = 40) { return this._log.slice(-n).map((x) => x.line); }

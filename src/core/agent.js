@@ -137,10 +137,17 @@ class WinAgent extends EventEmitter {
 
   // ---------------- 便捷方法 ----------------
 
-  /** 把模拟器窗口嵌进宿主窗口，并摆到 x,y,w,h（宿主客户区坐标） */
-  async embed(hostHwnd, rect) {
+  /**
+   * 嵌入指定运行时的窗口，返回代理报告的结果。
+   * @param {string} hostHwnd 宿主窗口句柄。
+   * @param {object} rect 宿主客户区内的像素矩形。
+   * @param {{port?: number, pid?: number}} target 模拟器控制台端口或自带 QEMU 进程号。
+   * @returns {Promise<object>} 嵌入结果与失败原因。
+   */
+  async embed(hostHwnd, rect, target) {
     return this.call({
       cmd: 'embed', host: String(hostHwnd),
+      port: target.port, pid: target.pid,
       x: Math.round(rect.x), y: Math.round(rect.y),
       w: Math.round(rect.w), h: Math.round(rect.h),
     });
@@ -157,8 +164,21 @@ class WinAgent extends EventEmitter {
   async rotate(dir = 'left') { return this.call({ cmd: 'rotate', dir }, 8000); }
   async hide() { return this.call({ cmd: 'hide' }, 3000); }
   async show() { return this.call({ cmd: 'show' }, 3000); }
+  /** 将模拟器窗口从应用窗口移出并隐藏，返回是否成功。 */
   async detach() { return this.call({ cmd: 'detach' }, 5000); }
-  async probe() { return this.call({ cmd: 'probe' }, 4000); }
+  /**
+   * 查找指定运行时的显示窗口，不改变窗口状态。
+   * @param {{port?: number, pid?: number}} target 模拟器控制台端口或 QEMU 进程号。
+   * @returns {Promise<object>} 窗口句柄与尺寸，未找到时句柄为 0。
+   */
+  async probe(target) { return this.call({ cmd: 'probe', port: target.port, pid: target.pid }, 4000); }
+
+  /**
+   * 隐藏指定模拟器启动时的原生窗口，直到应用画面嵌入。
+   * @param {number} port 模拟器控制台端口，传 0 取消监听。
+   * @returns {Promise<object>} 窗口代理确认结果。
+   */
+  async park(port) { return this.call({ cmd: 'park', port }); }
 
   /**
    * 全局鼠标钩子开关（幂等）。

@@ -5,7 +5,7 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { ZipArchive } = require('./zip');
+const { ZipArchive, ZipFile } = require('./zip');
 const { parseAxml, attr, attrValue, children, ANDROID_NS } = require('./axml');
 const { ResTable } = require('./arsc');
 
@@ -187,4 +187,29 @@ function quickCheck(filePath) {
   }
 }
 
-module.exports = { parseApk, quickCheck };
+/**
+ * 读取已缓存 APK 的启动 Activity 是否声明了横屏，避免重复加载整个包。
+ * @param {string} filePath 本地 APK 路径。
+ * @returns {boolean} 启动组件是否要求横屏。
+ */
+function launchesInLandscape(filePath) {
+    if (!filePath) return false;
+    let zip;
+    try {
+        zip = new ZipFile(filePath);
+        const manifest = parseAxml(zip.read('AndroidManifest.xml'));
+        const app = children(manifest, 'application')[0];
+        const activities = children(app, 'activity');
+        const launcher = activities.concat(children(app, 'activity-alias')).find(isLauncherActivity);
+        if (!launcher) return false;
+        const target = attrValue(launcher, 'targetActivity');
+        const entry = target ? activities.find((activity) => attrValue(activity, 'name') === target) : launcher;
+        return Boolean(entry && [0, 6, 8, 11].includes(attrValue(entry, 'screenOrientation')));
+    } catch (_) {
+        return false;
+    } finally {
+        zip?.close();
+    }
+}
+
+module.exports = { parseApk, quickCheck, launchesInLandscape };

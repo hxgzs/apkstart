@@ -272,29 +272,40 @@ const { AdbClient, friendlyInstallError, friendlyLaunchError } = require('../src
   });
 
   await test('启动参数带自动内存/核心/快照，且不再用弃用的 GPU 模式', () => {
-    const { EmulatorEngine } = require('../src/core/emulator');
+    const { EmulatorEngine, SNAPSHOT_NAME } = require('../src/core/emulator');
     const emu = new EmulatorEngine(path.join(__dirname, '..'));
     // 快照不存在时（全新 AVD / 刚被作废）绝不能传 -snapshot：
     // qemu 会一直等一份不存在的内存状态，进程活着但永不开机。
     const fresh = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
     assert(/-gpu software/.test(fresh));
+    assert(fresh.includes('-feature -Vulkan'), '启用快照时不能保存 Vulkan 状态');
+    if (process.platform === 'win32') {
+        assert(fresh.includes(',-HardwareDecoder'), 'Windows 快照应跳过无法恢复的宿主视频解码状态');
+    }
     assert(!/swiftshader_indirect/.test(fresh));
     assert(/-memory 2048/.test(fresh) && /-cores 2/.test(fresh));
-    if (!emu.hasSnapshot()) {
-      assert(/-no-snapshot/.test(fresh), '没有快照时必须是 -no-snapshot');
-      assert(!/-snapshot apkstart/.test(fresh), '没有快照时不能传 -snapshot');
-    }
-    // 快照确实存在时才走 quickboot
+    assert(fresh.includes('-no-snapshot-load') && !fresh.split(' ').includes('-no-snapshot'),
+        '冷启动仍需允许退出时显式保存快照');
+    assert(!/-snapshot apkstart/.test(fresh), '没有快照时不能传 -snapshot');
     const avdDir = path.join(emu.provisioner.paths().avdHome, 'apkstart.avd');
     const snapDir = path.join(avdDir, 'snapshots');
-    const created = !fs.existsSync(snapDir);
-    fs.mkdirSync(path.join(snapDir, 'apkstart'), { recursive: true });
+    const current = path.join(snapDir, SNAPSHOT_NAME);
+    for (const legacy of ['apkstart', `${SNAPSHOT_NAME}.failed-previous`]) {
+        const backup = path.join(snapDir, legacy);
+        fs.mkdirSync(backup, { recursive: true });
+        fs.writeFileSync(path.join(backup, 'snapshot.pb'), 'test');
+        fs.writeFileSync(path.join(backup, 'ram.bin'), 'test');
+    }
+    assert(!emu.hasSnapshot(), '旧 Vulkan 快照和失败备份不能作为当前快照');
+    fs.mkdirSync(current);
+    fs.writeFileSync(path.join(current, 'snapshot.pb'), 'test');
+    assert(!emu.hasSnapshot(), '缺少内存文件的快照不能尝试恢复');
+    fs.writeFileSync(path.join(current, 'ram.bin'), 'test');
     const withSnap = emu.buildArgs({ gpu: 'software', memoryMB: 2048, cores: 2, snapshot: true }).join(' ');
-    assert(/-snapshot apkstart/.test(withSnap), '有快照时应使用 quickboot 快照');
-    if (created) fs.rmSync(snapDir, { recursive: true, force: true });
+    assert(withSnap.endsWith(`-snapshot ${SNAPSHOT_NAME}`), '有快照时应加载当前图形配置的快照');
 
     const cold = emu.buildArgs({ wipe: true }).join(' ');
-    assert(/-wipe-data/.test(cold) && /-no-snapshot/.test(cold), 'wipe 时不能同时加载快照');
+    assert(/-wipe-data/.test(cold) && /-no-snapshot-load/.test(cold), 'wipe 时不能同时加载快照');
   });
 
   console.log('\n[显示 / 快捷方式 / 零操作]');

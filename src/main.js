@@ -9,9 +9,10 @@ const path = require('path');
 
 const store = require('./core/store');
 const { Runtime } = require('./core/engine');
+const { AdbClient } = require('./core/adb');
 const { Installer } = require('./core/installer');
 const { Sharer } = require('./core/sharer');
-const { parseApk } = require('./core/apk');
+const { parseApk, launchesInLandscape } = require('./core/apk');
 const { drawAppIcon } = require('./core/png');
 
 // 品牌 Logo（build/render-logo.js 生成）；缺失时回退到程序化绘制的旧版图标
@@ -157,6 +158,7 @@ let runtime = null;
 let installer = null;
 let sharer = null;
 let quitting = false;
+let quitReady = false;
 let winAgent = null;
 let appWin = null;
 let notifier = null;
@@ -253,18 +255,24 @@ function refreshPointerMapping() {
   else if (winAgent && winAgent.hooked) winAgent.setHook(false).catch(() => {});
 }
 
-/** 打开（或复用）那个「一个应用一个干净窗口」 */
-function openAppWindow(pkg, tip) {
+/**
+ * 打开应用的宿主窗口并显示启动进度。
+ * @param {string} pkg 应用包名。
+ * @param {string} tip 启动状态文案。
+ * @param {boolean} landscape 是否使用横屏窗口。
+ */
+function openAppWindow(pkg, tip, landscape) {
   const rec = store.getApp(pkg);
   appWin.open({
     pkg,
     label: (rec && rec.label) || pkg,
     iconPath: rec && rec.icoPath,
     portrait: portraitSize(),
+    landscape,
     fullscreen: displaySettings().mode === 'fullscreen',
   });
   appWin.setIcon(rec && rec.icoPath);
-  appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape: false });
+  appWin.setState({ tip: tip || '正在启动安卓运行时…', ready: false, landscape });
   currentAppPkg = pkg;
 }
 
@@ -411,11 +419,7 @@ function buildTray() {
       { type: 'separator' },
       {
         label: '退出',
-        click: async () => {
-          try { appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
-          quitting = true;
-          app.quit();
-        },
+        click: () => app.quit(),
       },
     ]);
     tray.setContextMenu(menu);
@@ -446,14 +450,37 @@ async function runInstall(filePath) {
   }
 }
 
-async function runLaunch(pkg) {
+let launchQueue = Promise.resolve();
+let startupMonitor = null;
+
+/**
+ * 按请求顺序打开应用，避免并发切换同一个窗口和模拟器。
+ * @param {string} pkg 要启动的 Android 包名。
+ * @returns {Promise<object>} 本次启动结果。
+ */
+function runLaunch(pkg) {
+    if (quitting) return Promise.resolve({ ok: false, error: 'ApkStart 正在退出' });
+    const launch = launchQueue.then(() => launchAndPresent(pkg));
+    launchQueue = launch.catch(() => {});
+    return launch;
+}
+
+/**
+ * 启动 Android 应用并在 Windows 上显示它的画面。
+ * @param {string} pkg 要启动的 Android 包名。
+ * @returns {Promise<object>} 窗口启动结果，或可展示的失败原因。
+ */
+async function launchAndPresent(pkg) {
+  startupMonitor?.abort();
   const t0 = Date.now();
   const mark = (s) => appLog(`launch ${pkg} ${s} +${Date.now() - t0}ms`);
   appLog(`launch start ${pkg}`);
   try {
-    // 1) 先把「应用窗口」打开显示启动动画：整个过程看不到安卓桌面，也看不到模拟器窗口
-    openAppWindow(pkg, '正在启动安卓运行时…');
-    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
+    await appWin.closing;
+    // 前台画面绘制前保持宿主窗口隐藏。
+    const landscape = launchesInLandscape(store.getApp(pkg)?.apkPath);
+    openAppWindow(pkg, '正在启动安卓运行时…', landscape);
+    if (appWin.embedded) await winAgent.hide();
 
     const r = await installer.launch(pkg, {
       onLog: (m) => { send('runtime:log', m); appLog(`  rt ${m}`); },
@@ -466,12 +493,21 @@ async function runLaunch(pkg) {
         mark('foreground ready');
       },
     });
-    mark('app started');
+    mark('app drawn');
 
-    // 2) 应用真的活下来了，才把画面嵌进窗口（否则用户会看到闪一下的桌面/崩溃页）
-    const embedded = await appWin.embed();
-    mark('embedded');
+    // 前台画面已绘制，嵌入后立即显示。
+    const target = runtime.windowTarget(r.serial);
+    if (target?.port) {
+        const displayClient = new AdbClient({ adbPath: runtime.adbPath(), serial: `emulator-${target.port}` });
+        await displayClient.rotateEmulatorDisplay(landscape);
+        mark(landscape ? 'landscape ready' : 'portrait ready');
+    }
+    await appWin.embed(target);
     appWin.setState({ ready: true, tip: '' });
+    appWin.win.show();
+    if (mainWindow && mainWindow.isVisible() && !IS_DEV) mainWindow.hide();
+    mark('embedded');
+    monitorPresentedApp(pkg, r.client, mark);
     // 容器会话：环境已经就绪，这里只做「按应用裁剪 + 打开后台轮询」，
     // 不再为这个 App 重新引导一遍 Android。鼠标键位钩子由窗口 focus 事件
     // 按设置决定，失焦即卸载。
@@ -479,15 +515,40 @@ async function runLaunch(pkg) {
     appWin.refreshPointer();
     await runtime.beginApp(pkg, { onActive: onContainerActive }).catch(() => {});
     send('app:launched', { package: pkg, engine: r.engine });
-    appLog(`launch ok ${pkg} embedded=${embedded}`);
-    return { ok: true, embedded };
+    appLog(`launch ok ${pkg} embedded=true serial=${r.serial}`);
+    return { ok: true, embedded: true };
   } catch (e) {
     appLog(`launch failed ${pkg}: ${e && (e.stack || e.message)}`);
-    try { appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
+    winAgent.park(0).catch(() => {});
+    try { await appWin.close({ keepApp: true }); } catch (_) { /* ignore */ }
     showWindow();
     send('toast', { type: 'error', message: `启动失败：${e.message}` });
     return { ok: false, error: e.message };
   }
+}
+
+/**
+ * 在窗口已经显示后观察启动崩溃，用户切换、关闭或退出时取消。
+ * @param {string} pkg 正在显示的 Android 包名。
+ * @param {AdbClient} client 启动该应用的设备。
+ * @param {Function} mark 记录启动阶段的回调。
+ */
+function monitorPresentedApp(pkg, client, mark) {
+    const monitor = new AbortController();
+    startupMonitor = monitor;
+    client.monitorAppStartup(pkg, monitor.signal).then((alive) => {
+        if (monitor.signal.aborted) return;
+        mark(`background alive ${alive}`);
+        if (alive) return;
+
+        // 与应用切换共用队列，避免旧应用的崩溃检查关闭新窗口。
+        launchQueue = launchQueue.then(async () => {
+            if (monitor.signal.aborted || quitting || !appWin.isOpen || appWin.pkg !== pkg) return;
+            await appWin.close();
+            showWindow();
+            send('toast', { type: 'error', message: '应用在窗口显示后退出，可以重新打开。' });
+        }).catch((error) => appLog(`startup monitor ${pkg}: ${error.message}`));
+    }).catch((error) => appLog(`startup monitor ${pkg}: ${error.message}`));
 }
 
 /**
@@ -988,7 +1049,9 @@ function registerIpc() {
     else w.maximize();
     appWin.scheduleFit();
   });
-  ipcMain.handle('shell:close', (e) => { winOf(e)?.close(); });
+  ipcMain.handle('shell:close', async (e) => {
+    if (winOf(e) === appWin.win) await appWin.close();
+  });
   ipcMain.handle('shell:rotate', () => appWin.rotate());
   ipcMain.handle('shell:back', async () => { await runtime.client().keyBack(); });
   ipcMain.handle('shell:forward', async () => { await runtime.client().keyForward(); });
@@ -1042,6 +1105,7 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', (_evt, argv) => {
+    if (quitting) return;
     const args = parseArgs(argv);
     if (args.launch) { runLaunch(args.launch); return; }
     if (args.apk) { runInstall(args.apk).catch(() => {}); return; }
@@ -1050,7 +1114,9 @@ if (!gotLock) {
 
   app.whenReady().then(async () => {
     store.ensureDirs();
-    runtime = new Runtime(APP_ROOT);
+    runtime = new Runtime(APP_ROOT, {
+        probeWindow: (target) => winAgent.probe(target),
+    });
     const l = launcherInfo();
     installer = new Installer(runtime, {
       launcherTarget: l.target,
@@ -1073,20 +1139,27 @@ if (!gotLock) {
 
     // 窗口代理：只负责内嵌模拟器窗口。全局鼠标钩子只在应用窗口前台时按配置安装。
     winAgent = new WinAgent();
+    runtime.emulator.parkWindow = (port) => winAgent.park(port);
     appWin = new AppWindow({
       agent: winAgent,
-      // 旋转要改 Android 的逻辑分辨率，交给 adb 客户端做
+      // 横竖屏按钮与应用切换共用同一个原生旋转入口。
       setOrientation: async (landscape) => {
         deviceSize.value = null;
-        return runtime.client().setOrientation(landscape);
+        const client = runtime.client();
+        const target = runtime.windowTarget(client.serial);
+        if (!target?.port) return client.setOrientation(landscape);
+        const display = new AdbClient({ adbPath: runtime.adbPath(), serial: `emulator-${target.port}` });
+        await display.rotateEmulatorDisplay(landscape);
+        return true;
       },
       // 传 getter：设置页改了键位，下一次窗口 focus / 刷新就生效，不用重启
       pointerConfig: () => pointer.pointerOptions(store.getSettings()),
     });
     appWin.onCloseApp((pkg) => {
+      startupMonitor?.abort();
       // 关窗口 = 停这个应用；最后一个窗口关掉时容器停放（降优先级、停轮询），
       // 但 Android 环境留着，下次点开是秒进而非重新冷启动。
-      runtime?.endApp(pkg, { onIdle: onContainerActive }).catch(() => {});
+      return runtime?.endApp(pkg, { onIdle: onContainerActive }).catch(() => {});
     });
 
     // 代理进程意外退出后会重建，事件监听必须一起重新挂上（旧版会在这里丢掉
@@ -1189,7 +1262,6 @@ if (!gotLock) {
           } catch (e) {
             console.error('[smoke] 截图失败', e);
           }
-          quitting = true;
           app.quit();
         }, 6500);
       });
@@ -1201,18 +1273,40 @@ if (!gotLock) {
   app.on('window-all-closed', () => {
     // 正常关闭窗口时只隐藏到托盘（close 事件已拦截），
     // 走到这里说明是真正要退出，必须放行，否则进程会残留并占住单实例锁。
-    if (quitting) app.exit(0);
+    if (quitReady) app.exit(0);
   });
 
-  app.on('before-quit', () => {
-    quitting = true;
-    sharer?.stop();
-    notifier?.stop();
-    try { appWin?.close({ keepApp: false }); } catch (_) { /* ignore */ }
-    try { winAgent?.dispose(); } catch (_) { /* ignore */ }
-    try { wheelRouter?.dispose(); } catch (_) { /* ignore */ }
-    runtime?.dispose();
-    // 隐藏的图标解码窗口也算一个窗口，不关掉会让 window-all-closed 永远不触发
-    try { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); } catch (_) { /* ignore */ }
+  app.on('before-quit', (event) => {
+      if (quitReady) return;
+      event.preventDefault();
+      if (quitting) return;
+      quitting = true;
+      startupMonitor?.abort();
+      const started = Date.now();
+      appLog('quit start');
+      finishQuit().catch((error) => appLog(`quit failed: ${error.message}`)).finally(() => {
+          appLog(`quit complete +${Date.now() - started}ms`);
+          quitReady = true;
+          app.quit();
+      });
   });
+}
+
+/**
+ * 收起应用窗口，完成快照与关机后释放桌面代理。
+ * @returns {Promise<void>} ApkStart 已准备好退出。
+ */
+async function finishQuit() {
+    try {
+        await launchQueue;
+        await appWin?.close({ keepApp: true }).catch(() => {});
+        sharer?.stop();
+        notifier?.stop();
+        await runtime?.dispose({ onLog: (message) => appLog(`  rt ${message}`) });
+    } finally {
+        try { appWin?.win?.destroy(); } catch (_) { /* 窗口已关闭 */ }
+        try { winAgent?.dispose(); } catch (_) { /* 代理已退出 */ }
+        try { wheelRouter?.dispose(); } catch (_) { /* 输入通道已退出 */ }
+        try { if (decodeWindow && !decodeWindow.isDestroyed()) decodeWindow.destroy(); } catch (_) { /* 窗口已关闭 */ }
+    }
 }
